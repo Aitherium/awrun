@@ -1,0 +1,37 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  # Manual re-run: re-drive a publish after a transient PyPI/network failure
+  # without cutting a new release. `skip-existing: true` below makes a re-run
+  # of an already-published version a no-op upload.
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test tools
+        run: |
+          pip install build
+          pip install -e .
+          pip install pytest pytest-timeout
+      - name: Run the test suite before publishing
+        run: python -m pytest tests/ -q --timeout=180
+      - name: Build package
+        run: python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

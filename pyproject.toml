@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awrun"
+version = "0.1.0"
+description = "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds — real dynamic priority for the class of work we control, instead of GitHub Actions' opaque FIFO."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+# `--kind ci` dispatch shells out to `gh`, so it needs no extra Python dep beyond
+# the CLI being on PATH. Declared here anyway so a missing `gh` fails with a
+# clear message at submit time rather than a bare FileNotFoundError.
+ci = []
+
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+awrun = "awrun.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Aitherium/awrun"
+Documentation = "https://github.com/Aitherium/awrun#readme"
+Repository = "https://github.com/Aitherium/awrun.git"
+Issues = "https://github.com/Aitherium/awrun/issues"
+
+[tool.setuptools]
+packages = ["awrun"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501", "E402", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
