@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1",
+  "name": "awrun",
+  "description": "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds.",
+  "url": "https://aitherium.github.io/awrun/",
+  "repository": "https://github.com/Aitherium/awrun",
+  "kind": "runtime",
+  "status": "public",
+  "adopt": "Queue two runs at different priorities and watch the urgent one overtake.",
+  "pairs_with": [
+    "awdk",
+    "awrelay"
+  ],
+  "includes": []
+}
