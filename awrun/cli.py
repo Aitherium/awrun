@@ -204,9 +204,81 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel", help="withdraw a queued/claimed run", parents=[json_flag])
     cancel.add_argument("id")
 
+    groups = sub.add_parser(
+        "groups", parents=[json_flag],
+        help="reserved CI capacity: which workflows may never queue behind CI")
+    groups.add_argument("action",
+                        choices=["list", "show", "audit", "reserve", "release"])
+    groups.add_argument("--org", default="Aitherium")
+    groups.add_argument("--group", default="deploy")
+    groups.add_argument("--workflow", default="",
+                        help="Org/Repo/.github/workflows/x.yml@refs/heads/BRANCH "
+                             "-- the ref is required and its absence is not "
+                             "reported by the API")
+    groups.add_argument("--runner", default="", help="ORG runner name")
+    groups.add_argument("--label", default="",
+                        help="label the workflow asks for (default: group name)")
+
     sub.add_parser("self-test", help="run the built-in self-test")
 
     return parser
+
+
+def cmd_groups(args: argparse.Namespace, store: "RunStore") -> int:
+    """Reserved CI capacity, ranked on the same priority scale as runs.
+
+    Takes no store: reservations live in GitHub, not the local queue. It is a
+    subcommand of awrun anyway because it answers the same question the queue
+    does -- what runs first when there is not enough to go round -- and putting
+    it anywhere else guarantees the two rankings drift apart.
+    """
+    from . import runner_groups as rg
+
+    try:
+        if args.action == "list":
+            rows = rg.list_groups(args.org)
+            for g in rows:
+                mark = "restricted" if g.get("restricted_to_workflows") else "OPEN"
+                print(f"  {g['name']:20} id={g['id']:<4} {mark}")
+            if not rows:
+                print("  (no runner groups)")
+            return 0
+
+        if args.action == "show":
+            d = rg.describe(args.org, args.group)
+            print(json.dumps(d, indent=2) if args.json else
+                  f"  {d['name']} (id={d['id']}) restricted="
+                  f"{d['restricted_to_workflows']}\n"
+                  f"  workflows: {d['selected_workflows'] or '(none)'}\n"
+                  f"  runners:   {[r['name'] for r in d['runners']] or '(none)'}")
+            return 0
+
+        if args.action == "audit":
+            # A group with runners and no restriction LOOKS reserved in every
+            # listing and admits the whole org. That is the failure this
+            # command exists to make visible, so it exits non-zero.
+            problems = rg.audit(args.org)
+            for line in problems:
+                print(f"  NOT RESERVED: {line}")
+            if not problems:
+                print("  every non-default group with runners is restricted")
+            return 1 if problems else 0
+
+        if args.action == "reserve":
+            d = rg.reserve(args.org, args.group, args.workflow, args.runner,
+                           label=args.label or args.group)
+            print(f"  reserved {args.runner} for {args.workflow}")
+            print(f"  group {d['name']} now admits: {d['selected_workflows']}")
+            return 0
+
+        if args.action == "release":
+            rg.release(args.org, args.group, args.runner)
+            print(f"  released {args.runner} back to general availability")
+            return 0
+    except rg.RunnerGroupError as exc:
+        print(f"awrun groups: {exc}", file=sys.stderr)
+        return 1
+    return 2
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -231,6 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "queue": cmd_queue,
         "status": cmd_status,
         "cancel": cmd_cancel,
+        "groups": cmd_groups,
     }
     return handlers[args.command](args, store)
 
