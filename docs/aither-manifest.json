@@ -9,17 +9,18 @@
   "adopt": "Queue two runs at different priorities and watch the urgent one overtake.",
   "pairs_with": [
     "awdk",
-    "awrelay"
+    "awrelay",
+    "awevolve"
   ],
   "includes": [],
   "metrics": {
     "files": {
       "value": 17,
-      "as_of": "2026-08-22T11:42:24-07:00"
+      "as_of": "2026-08-22T18:47:19-07:00"
     },
     "tests": {
       "value": 1,
-      "as_of": "2026-08-22T11:42:24-07:00"
+      "as_of": "2026-08-22T18:47:19-07:00"
     }
   }
 }
