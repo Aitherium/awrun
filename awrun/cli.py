@@ -10,11 +10,79 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from pathlib import Path
 from typing import Optional, Sequence
 
 from awrun.store import CLOSED_STATUSES, RunError, RunItem, RunStore, get_store
+
+#: The file whose presence identifies a monorepo checkout. Chosen because it is
+#: the very module the capacity provider needs, so the marker cannot drift away
+#: from what it is a marker FOR.
+_MONOREPO_MARKER = ("AitherOS", "dev", "tools", "awrun_capacity.py")
+
+
+def _monorepo_root():
+    """The checkout root above this file, or None when there is not one."""
+    import pathlib as _pl
+    here = _pl.Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent.joinpath(*_MONOREPO_MARKER)).is_file():
+            return parent
+    return None
+
+
+def _add_monorepo_root_to_syspath() -> None:
+    """Idempotent. Silent when there is no monorepo -- that is the PyPI case."""
+    import sys as _sys
+    root = _monorepo_root()
+    if root is not None and str(root) not in _sys.path:
+        _sys.path.insert(0, str(root))
+
+
+def _register_capacity_provider() -> None:
+    """Register the host's capacity provisioner with awrun.plugins if available.
+
+    This allows ``awrun capacity --add --execute`` to launch new CI runners on AWS.
+    If the provisioner is not available (e.g., on a stranger's machine), the command
+    still works and honestly reports that no provider is registered -- it is a normal
+    state, not an error.
+    """
+    from . import plugins
+
+    if plugins.get(plugins.PROVISION_CAPACITY) is not None:
+        # Already registered (e.g., by the wrapper script)
+        return
+
+    # Put the monorepo root on sys.path if we are inside one. Without this the
+    # import below fails with ModuleNotFoundError on the very host that owns the
+    # AWS account -- measured 2026-08-24, `awrun capacity --add` reported "no
+    # capacity provider is registered" against a real 40-job backlog, and the
+    # same command with PYTHONPATH set provisioned correctly. A capacity plane
+    # that only works when the caller knows an incantation is inert.
+    #
+    # Safe for a stranger: awrun ships to PyPI, the walk finds no marker, and the
+    # existing fallback reports "no provider registered" -- a normal state for a
+    # machine with no cloud account, not an error. No absolute path is baked in;
+    # this package is public and a hardcoded root would be both a disclosure and
+    # wrong on every other machine, our own Linux runners included.
+    _add_monorepo_root_to_syspath()
+
+    try:
+        # Try to import from the monorepo dev tools
+        # This succeeds only on the host; it fails gracefully on PyPI/strangers
+        from AitherOS.dev.tools.awrun_capacity import provision_capacity
+        plugins.register(plugins.PROVISION_CAPACITY, provision_capacity)
+    except (ImportError, ModuleNotFoundError) as exc:
+        # Absent is FINE for a stranger: awrun ships to PyPI and still measures
+        # saturation without a provisioner. But on a host that plainly HAS the
+        # monorepo, a swallowed ImportError is how a provisioner stays dead for
+        # weeks -- `awrun capacity --add --execute` exits 0 with added=0 and
+        # reads exactly like "nothing needed provisioning". So keep the graceful
+        # path and record WHY, for the one place that can tell the difference.
+        plugins.PROVISION_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 def _fmt_age(seconds: float) -> str:
@@ -35,6 +103,52 @@ def _print_item(item: RunItem, *, as_json: bool) -> None:
           f"{age:>5} old  {label}")
 
 
+def _submit_comet_deploy_spec(args: argparse.Namespace) -> dict:
+    spec: dict = {}
+    if args.spec_json:
+        try:
+            spec.update(json.loads(args.spec_json))
+        except json.JSONDecodeError as exc:
+            raise RunError(f"--spec-json is not valid JSON: {exc}") from exc
+    if args.service_name:
+        spec["service_name"] = args.service_name
+    if args.target:
+        spec["target"] = args.target
+    return spec
+
+
+def _authorize_comet_deploy(spec: dict) -> Optional[str]:
+    """Phase 8: only comet-deploy is gated. Returns an error string on
+    denial, or None on success -- resolving, checking and auditing happen
+    together here so a caller cannot accidentally submit without all three.
+    Fails CLOSED at every step: no token, no resolution, no permission, or a
+    failed audit write are ALL refusals, never a silent allow."""
+    from awrun import authz
+
+    token = os.getenv("AITHER_SESSION_BEARER", "").strip()
+    subject_id = authz.resolve_session(token)
+    if not subject_id:
+        authz.audit("comet-deploy-denied", reason="no resolved session",
+                     spec=spec)
+        return ("comet-deploy requires a resolved awiam session -- set "
+                "AITHER_SESSION_BEARER to a valid session token")
+
+    decision = authz.check_permission(subject_id)
+    if not decision:
+        authz.audit("comet-deploy-denied", subject=subject_id,
+                     reason=decision.reason, spec=spec)
+        return f"comet-deploy refused for {subject_id!r}: {decision.reason}"
+
+    record = authz.audit("comet-deploy-submitted", subject=subject_id,
+                          reason=decision.reason, spec=spec)
+    if record is None:
+        # Money-spend path fails closed if it can't be recorded -- an
+        # unaudited spend is not something this package will let through
+        # even though the authz decision itself was ALLOW.
+        return "comet-deploy refused: could not write the audit record (spend must be auditable)"
+    return None
+
+
 def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
     spec: dict = {}
     if args.kind == "ci":
@@ -48,6 +162,20 @@ def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
             k, v = kv.split("=", 1)
             inputs[k] = v
         spec["inputs"] = inputs
+    elif args.kind == "comet-deploy":
+        try:
+            spec = _submit_comet_deploy_spec(args)
+        except RunError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if not spec.get("service_name"):
+            print("ERROR: --service-name is required for --kind comet-deploy "
+                  "(or set it in --spec-json)", file=sys.stderr)
+            return 2
+        denial = _authorize_comet_deploy(spec)
+        if denial is not None:
+            print(f"ERROR: {denial}", file=sys.stderr)
+            return 1
     else:
         if not args.task:
             print("ERROR: --task is required for --kind agent", file=sys.stderr)
@@ -154,6 +282,79 @@ def _self_test() -> int:
         check("a second claim on an already-claimed item returns None, not an error",
               again is None)
 
+    # ── Phase 8: comet-deploy submit is trust-plane gated end to end ─────
+    with tempfile.TemporaryDirectory() as td:
+        store = RunStore(td)
+
+        no_token_args = argparse.Namespace(
+            kind="comet-deploy", priority=0, paths=[], json=False,
+            service_name="my-svc", target="docker", spec_json=None,
+        )
+        old_env = {k: os.environ.pop(k, None) for k in
+                   ("AITHER_SESSION_BEARER", "AWRUN_COMET_DEPLOY_OPERATORS",
+                    "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
+        try:
+            rc = cmd_submit(no_token_args, store)
+            check("comet-deploy submit with NO session token is refused (exit 1)", rc == 1)
+            check("...and nothing was queued as a result",
+                  len(store.list(statuses=["queued"], kind="comet-deploy")) == 0)
+
+            iam_path = Path(td) / "iam.json"
+            audit_path = Path(td) / "audit.log"
+            os.environ["AWRUN_IAM_DIRECTORY"] = str(iam_path)
+            os.environ["AWRUN_AUDIT_LOG"] = str(audit_path)
+
+            from awiam import Directory, Sessions, Subject
+            directory = Directory(str(iam_path))
+            directory.put(Subject(id="ops-dave", display="Dave"))
+            token = Sessions(directory).issue("ops-dave")
+            os.environ["AITHER_SESSION_BEARER"] = token or ""
+
+            # Resolved session, but NOT in the operator allowlist.
+            os.environ.pop("AWRUN_COMET_DEPLOY_OPERATORS", None)
+            rc2 = cmd_submit(no_token_args, store)
+            check("a resolved session with NO comet-deploy permission is still refused",
+                  rc2 == 1)
+            check("...and audit recorded the denial",
+                  audit_path.exists() and "comet-deploy-denied" in audit_path.read_text())
+
+            # Now grant the permission and retry the SAME submit.
+            os.environ["AWRUN_COMET_DEPLOY_OPERATORS"] = "ops-dave"
+            rc3 = cmd_submit(no_token_args, store)
+            check("a resolved session WITH the operator role succeeds (exit 0)", rc3 == 0)
+            queued = store.list(statuses=["queued"], kind="comet-deploy")
+            check("the comet-deploy item actually reached the queue",
+                  len(queued) == 1 and queued[0].spec.get("service_name") == "my-svc")
+            check("audit recorded the ALLOWED submit too",
+                  "comet-deploy-submitted" in audit_path.read_text())
+        finally:
+            for k, v in old_env.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
+        # kind=agent/ci submits are UNCHANGED -- no token required at all.
+        os.environ.pop("AITHER_SESSION_BEARER", None)
+        agent_args = argparse.Namespace(
+            kind="agent", priority=0, paths=[], json=False,
+            task="do a thing", agent="local-5090", adk_args=[],
+        )
+        rc4 = cmd_submit(agent_args, store)
+        check("kind=agent submit needs NO session token at all (light-touch by design)",
+              rc4 == 0)
+
+    # The capacity decision runs HERE, not only under its own import. A
+    # self-test that nothing invokes is documentation (HYG001): `awrun
+    # self-test` is the command anyone actually types, so a rule not reachable
+    # from it is a rule nobody has watched fail.
+    from . import capacity as _cap
+    if _cap.self_test() != 0:
+        ok = False
+    from . import surface as _sf
+    if _sf.self_test() != 0:
+        ok = False
+
     print("SELF-TEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -174,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     json_flag.add_argument("--json", action="store_true", help="machine-readable output")
 
     submit = sub.add_parser("submit", help="queue a new run", parents=[json_flag])
-    submit.add_argument("--kind", choices=["agent", "ci"], required=True)
+    submit.add_argument("--kind", choices=["agent", "ci", "comet-deploy"], required=True)
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--paths", nargs="*", default=[],
                          help="paths this run will touch (lease-awareness)")
@@ -187,6 +388,14 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--ref", help="[kind=ci] git ref (default: develop)")
     submit.add_argument("--field", action="append",
                          help="[kind=ci] workflow_dispatch input as key=value, repeatable")
+    submit.add_argument("--service-name", dest="service_name",
+                         help="[kind=comet-deploy] AitherComet DeployRequest.service_name")
+    submit.add_argument("--target", help="[kind=comet-deploy] deploy target "
+                                          "(docker|k8s|systemd|podman|cloud-gpu|"
+                                          "sovereign-iso|aitherzero-playbook|omninode)")
+    submit.add_argument("--spec-json", dest="spec_json",
+                         help="[kind=comet-deploy] full AitherComet DeployRequest body as "
+                              "a JSON object; --service-name/--target override matching keys")
 
     bump = sub.add_parser("bump", help="change a queued/claimed run's priority",
                            parents=[json_flag])
@@ -218,6 +427,37 @@ def build_parser() -> argparse.ArgumentParser:
     groups.add_argument("--runner", default="", help="ORG runner name")
     groups.add_argument("--label", default="",
                         help="label the workflow asks for (default: group name)")
+
+    cap = sub.add_parser(
+        "capacity", parents=[json_flag],
+        help="is the runner pool big enough for the queue -- and add to it")
+    cap.add_argument("--org", default="Aitherium")
+    cap.add_argument("--label", default="aws",
+                     help="the pool to judge (default: aws). A runner in "
+                          "another pool cannot take this work.")
+    cap.add_argument("--add", action="store_true",
+                     help="ask the host's registered provider to add runners. "
+                          "Without a provider this reports the gap and does "
+                          "nothing -- awrun decides, a host provisions.")
+    cap.add_argument("--execute", action="store_true",
+                     help="with --add, actually create capacity. Omit for a "
+                          "dry run: this spends money and awrun will not do "
+                          "that on its own.")
+
+    surf = sub.add_parser(
+        "surface", parents=[json_flag],
+        help="CI state across every PUBLIC repo at once, and fan a dispatch "
+             "across them (free hosted compute -- see surface.py on why this "
+             "is dispatch and not hosting)")
+    surf.add_argument("--org", default="Aitherium")
+    surf.add_argument("--dispatch", default="",
+                      help="workflow name, file or stem to run on every repo "
+                           "that HAS it; repos that do not are named, never "
+                           "silently skipped")
+    surf.add_argument("--ref", default="main",
+                      help="ref to dispatch against (default: main)")
+    surf.add_argument("--execute", action="store_true",
+                      help="with --dispatch, actually start the runs")
 
     sub.add_parser("self-test", help="run the built-in self-test")
 
@@ -281,12 +521,148 @@ def cmd_groups(args: argparse.Namespace, store: "RunStore") -> int:
     return 2
 
 
+def cmd_capacity(args: argparse.Namespace, store: "RunStore") -> int:
+    """Measure the queue against the pool, and optionally grow it.
+
+    Exit 0 healthy, 1 saturated, 2 could not judge. Saturated is a real non-zero
+    because it is an actionable state, and a run that cannot reach the API must
+    never report a healthy pool -- that is the one wrong answer here.
+    """
+    from . import capacity as cap
+    from .runner_groups import _api, org_runners
+
+    try:
+        runners = org_runners(args.org)
+        # Queued WORKFLOW RUNS, not jobs: a run with no free runner never
+        # creates its jobs at all (measured -- superseded runs report jobs=0),
+        # so counting jobs would systematically under-report the very
+        # saturation this command exists to see.
+        runs = _api(f"/repos/{args.org}/AitherOS/actions/runs"
+                    f"?status=queued&per_page=100")
+        queued = int(runs.get("total_count", 0))
+    except Exception as e:                      # noqa: BLE001
+        print(f"capacity: could not reach the GitHub API ({e}) -- cannot judge",
+              file=sys.stderr)
+        return 2
+
+    verdict = cap.assess(queued, runners, label=args.label)
+
+    result = dict(verdict)
+    if args.add:
+        result["provision"] = cap.provision(verdict["want"],
+                                            dry_run=not args.execute)
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        v = verdict
+        print(f"pool '{v['label']}': {v['idle']} idle of {v['pool']} online, "
+              f"{v['queued']} queued (ratio {v['ratio']})")
+        print(f"verdict: {'SATURATED' if v['saturated'] else 'healthy'}"
+              + (f" -- wants {v['want']} more runner(s)" if v["want"] else ""))
+        if args.add:
+            p = result["provision"]
+            print(f"provision: added={p['added']} -- {p['detail']}")
+
+    # Asking for capacity and getting none because NOTHING CAN PROVISION is a
+    # failure, and it must not exit 0. Measured: `awrun capacity --add --execute`
+    # returned 0 with added=0 while the provider had silently failed to import,
+    # so the caller could not distinguish "provisioned nothing, none needed" from
+    # "cannot provision at all". A scheduler reading that exit code would report
+    # healthy capacity forever.
+    if args.add and result.get("provision", {}).get("provider", "") is None:
+        from . import plugins as _pl
+        why = getattr(_pl, "PROVISION_IMPORT_ERROR", None)
+        print("ERROR: --add requested but NO capacity provider is registered"
+              + (f" (import failed: {why})" if why else "")
+              + ". Nothing was provisioned.", file=sys.stderr)
+        return 2
+
+    return 1 if verdict["saturated"] else 0
+
+
+def cmd_surface(args: argparse.Namespace, store: "RunStore") -> int:
+    """CI health across the public surface. Exit 0 all green, 1 gaps, 2 DEAD."""
+    from . import surface as sf
+    from .runner_groups import _api
+
+    try:
+        repos = _api(f"/orgs/{args.org}/repos?type=public&per_page=100")
+        # Forks are somebody else's project. Reporting "no CI" on a vendored
+        # upstream is noise, and noise is what gets a report ignored.
+        repos = [r for r in repos if not r.get("fork")]
+    except Exception as e:                      # noqa: BLE001
+        print(f"surface: cannot reach the GitHub API ({e}) -- cannot judge",
+              file=sys.stderr)
+        return 2
+    if not repos:
+        print("surface: the org reported NO public repos -- refusing to call "
+              "that a clean surface", file=sys.stderr)
+        return 2
+
+    rows, dispatched, missing = [], [], []
+    for r in repos:
+        name = r["name"]
+        try:
+            wfs = _api(f"/repos/{args.org}/{name}/actions/workflows").get(
+                "workflows", [])
+            runs = _api(f"/repos/{args.org}/{name}/actions/runs?per_page=5").get(
+                "workflow_runs", [])
+        except Exception:                       # noqa: BLE001
+            rows.append({"repo": name, "state": "unknown", "workflows": 0,
+                         "detail": "could not be read"})
+            continue
+        rows.append(sf.classify(name, wfs, runs))
+        if args.dispatch:
+            wid = sf.dispatchable(wfs, args.dispatch)
+            if wid is None:
+                missing.append(name)
+            elif args.execute:
+                try:
+                    _api(f"/repos/{args.org}/{name}/actions/workflows/{wid}"
+                         f"/dispatches", method="POST", body={"ref": args.ref})
+                    dispatched.append(name)
+                except Exception as e:          # noqa: BLE001
+                    missing.append(f"{name} (dispatch failed: "
+                                   f"{type(e).__name__})")
+            else:
+                dispatched.append(name)
+
+    summary = sf.summarise(rows)
+    if getattr(args, "json", False):
+        print(json.dumps({"rows": rows, "summary": summary,
+                          "dispatched": dispatched, "missing": missing},
+                         indent=2))
+    else:
+        for row in sorted(rows, key=lambda x: (x["state"], x["repo"])):
+            if row["state"] != "green":
+                print(f"  {row['state']:<8} {row['repo']:<22} {row['detail'][:46]}")
+        b = summary["by_state"]
+        print("")
+        print(f"{summary['total']} public repos: "
+              + ", ".join(f"{v} {k}" for k, v in sorted(b.items())))
+        if summary["no_ci"]:
+            print(f"no CI at all: {', '.join(summary['no_ci'])}")
+        if args.dispatch:
+            verb = "dispatched" if args.execute else "would dispatch"
+            print(f"{verb} '{args.dispatch}' to {len(dispatched)}: "
+                  f"{', '.join(dispatched) or '-'}")
+            if missing:
+                print(f"no such workflow in {len(missing)}: "
+                      f"{', '.join(missing[:10])}")
+    return 0 if not (summary["no_ci"] or summary["red"]) else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     # GENERATED doctor intercept (gen_aw_doctor.py) -- do not edit
     _dv = locals().get("argv")
     if (_dv if _dv is not None else __import__("sys").argv[1:])[:1] == ["doctor"]:
         from ._doctor import report
         return report()
+
+    # Register the capacity provisioner if available (from the monorepo host)
+    _register_capacity_provider()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -304,6 +680,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "status": cmd_status,
         "cancel": cmd_cancel,
         "groups": cmd_groups,
+        "capacity": cmd_capacity,
+        "surface": cmd_surface,
     }
     return handlers[args.command](args, store)
 

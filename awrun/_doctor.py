@@ -23,8 +23,8 @@ import sys
 #: package cannot read the registry, and a doctor that guessed at the family
 #: would go stale in silence. Regenerate to update.
 SELF = 'awrun'
-FAMILY = ['awbac', 'awbrowse', 'awdit', 'awfind', 'awgit', 'awgraph', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpredict', 'awprism', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrepl', 'awresearch', 'awseal', 'awshare', 'awtunnel']
-PAIRS_WITH = ['adk', 'awrelay']
+FAMILY = ['awask', 'awask', 'awbac', 'awbrowse', 'awdit', 'awevolve', 'awevolve', 'awfind', 'awgit', 'awgraph', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpredict', 'awprism', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrepl', 'awresearch', 'awseal', 'awshare', 'awtunnel']
+PAIRS_WITH = ['adk', 'awevolve', 'awrelay']
 
 #: This brick's OWN config, read out of its source at generation time.
 #: ENV_REQUIRED is `os.environ["X"]` -- absent, that is a KeyError the moment
@@ -32,8 +32,8 @@ PAIRS_WITH = ['adk', 'awrelay']
 #: the caller cope. Only this brick's namespace is listed: reporting the
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
-ENV_REQUIRED = []
-ENV_OPTIONAL = []
+ENV_REQUIRED = ['AWRUN_AUDIT_LOG', 'AWRUN_COMET_DEPLOY_OPERATORS', 'AWRUN_IAM_DIRECTORY']
+ENV_OPTIONAL = ['AWRUN_CA_BUNDLE']
 
 
 def _installed(mod: str) -> "str | None":

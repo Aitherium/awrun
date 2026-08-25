@@ -41,7 +41,7 @@ import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 STATUS_QUEUED = "queued"
 STATUS_CLAIMED = "claimed"
@@ -57,7 +57,10 @@ ALL_STATUSES = (STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 CLOSED_STATUSES = frozenset({STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED})
 OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
 
-KINDS = ("agent", "ci")
+#: "comet-deploy" added for Phase 7 (the one cloud-facing kind: a thin
+#: passthrough to AitherComet's own /deploy, which already tenant-scopes and
+#: cost-gates -- see dispatcher.py's _run_comet_deploy).
+KINDS = ("agent", "ci", "comet-deploy")
 
 #: Ids are typed by humans ("awrun bump r-7f3a --priority 5"), so short and an
 #: unambiguous alphabet — no 0/o/1/l. Same convention as decisions/store.py.
@@ -214,11 +217,18 @@ class RunStore:
             item.claimed_by = worker_id
         return self._move(item_id, STATUS_QUEUED, STATUS_CLAIMED, mutate=_set_claimant)
 
-    def claim_next(self, *, worker_id: str, kind: Optional[str] = None) -> Optional[RunItem]:
+    def claim_next(self, *, worker_id: str, kind: Optional[str] = None,
+                   skip: Optional[Callable[[RunItem], bool]] = None) -> Optional[RunItem]:
         """Claim the single highest-priority queued item, retrying the next
-        candidate if a race loses the top one. Returns None only when
-        nothing claimable remains."""
+        candidate if a race loses the top one, or if `skip` says this
+        particular item is not claimable right now (Phase 4: an item whose
+        `paths` collide with a peer's live awgit lease). `skip` returning
+        True does NOT remove the item from the queue -- it is tried again on
+        the next dispatch cycle, once the lease has cleared. Returns None
+        only when nothing claimable remains after both checks."""
         for item in self.list(statuses=[STATUS_QUEUED], kind=kind):
+            if skip is not None and skip(item):
+                continue
             claimed = self.claim(item.id, worker_id=worker_id)
             if claimed is not None:
                 return claimed
