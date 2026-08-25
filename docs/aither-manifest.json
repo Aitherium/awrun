@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1",
   "name": "awrun",
-  "description": "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds.",
+  "description": "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds. It also judges whether the runner pool is big enough for the queue it is draining, and can ask a host to grow it -- reserving capacity is zero-sum, so a saturated pool needs more of it, not a different share of it.",
   "url": "https://aitherium.github.io/awrun/",
   "repository": "https://github.com/Aitherium/awrun",
   "kind": "runtime",
@@ -10,17 +10,18 @@
   "pairs_with": [
     "awdk",
     "awrelay",
-    "awevolve"
+    "awevolve",
+    "awrise"
   ],
   "includes": [],
   "metrics": {
     "files": {
-      "value": 17,
-      "as_of": "2026-08-22T18:47:19-07:00"
+      "value": 21,
+      "as_of": "2026-08-25T06:17:51-07:00"
     },
     "tests": {
       "value": 1,
-      "as_of": "2026-08-22T18:47:19-07:00"
+      "as_of": "2026-08-25T06:17:51-07:00"
     }
   }
 }
