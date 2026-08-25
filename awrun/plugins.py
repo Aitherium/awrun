@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 #: and the quota; awrun owns only the decision that more is needed.
 PROVISION_CAPACITY = "provision_capacity"
 
+#: Scale-DOWN hook. Declared beside PROVISION_CAPACITY because an
+#: autoscaler with only the growth half is a spend generator: every instance
+#: it launches bills until something hands it back.
+REAP_CAPACITY = "reap_capacity"
+
 #: Why the host provisioner failed to import, when it did. None means it was
 #: never attempted or it succeeded. Recorded rather than swallowed: a silent
 #: ImportError leaves `awrun capacity --add` exiting 0 having done nothing,

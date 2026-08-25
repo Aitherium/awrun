@@ -73,8 +73,16 @@ def _register_capacity_provider() -> None:
     try:
         # Try to import from the monorepo dev tools
         # This succeeds only on the host; it fails gracefully on PyPI/strangers
-        from AitherOS.dev.tools.awrun_capacity import provision_capacity
+        from AitherOS.dev.tools.awrun_capacity import (
+            provision_capacity,
+            reap_capacity,
+        )
         plugins.register(plugins.PROVISION_CAPACITY, provision_capacity)
+        # Registered in the SAME place as the provisioner on purpose: an
+        # autoscaler that can grow and cannot shrink is a spend generator, and
+        # wiring the two halves apart is how one of them stays unwired.
+        plugins.register(getattr(plugins, "REAP_CAPACITY", "reap_capacity"),
+                         reap_capacity)
     except (ImportError, ModuleNotFoundError) as exc:
         # Absent is FINE for a stranger: awrun ships to PyPI and still measures
         # saturation without a provisioner. But on a host that plainly HAS the
@@ -439,6 +447,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="ask the host's registered provider to add runners. "
                           "Without a provider this reports the gap and does "
                           "nothing -- awrun decides, a host provisions.")
+    cap.add_argument("--reap", action="store_true",
+                     help="give back idle runners once the queue is drained. "
+                          "The scale-down half: --add alone only ever grows a "
+                          "pool, and every instance it launches bills until "
+                          "something hands it back.")
     cap.add_argument("--execute", action="store_true",
                      help="with --add, actually create capacity. Omit for a "
                           "dry run: this spends money and awrun will not do "
@@ -550,7 +563,20 @@ def cmd_capacity(args: argparse.Namespace, store: "RunStore") -> int:
     result = dict(verdict)
     if args.add:
         result["provision"] = cap.provision(verdict["want"],
-                                            dry_run=not args.execute)
+                                            dry_run=not args.execute,
+                                            label=args.label)
+
+    if getattr(args, "reap", False):
+        # Uses the SAME verdict["queued"] that --add reads, from the same call,
+        # so the two halves can never disagree about whether work is waiting.
+        from . import plugins as _pl
+        reaper = _pl.get(getattr(_pl, "REAP_CAPACITY", "reap_capacity"))
+        if reaper is None:
+            result["reap"] = {"reaped": 0, "provider": None,
+                              "detail": "no reap provider is registered"}
+        else:
+            result["reap"] = reaper(verdict["queued"], args.label,
+                                    not args.execute)
 
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2))
@@ -563,6 +589,9 @@ def cmd_capacity(args: argparse.Namespace, store: "RunStore") -> int:
         if args.add:
             p = result["provision"]
             print(f"provision: added={p['added']} -- {p['detail']}")
+        if getattr(args, "reap", False):
+            r = result["reap"]
+            print(f"reap: reaped={r.get('reaped', 0)} -- {r.get('detail', '')}")
 
     # Asking for capacity and getting none because NOTHING CAN PROVISION is a
     # failure, and it must not exit 0. Measured: `awrun capacity --add --execute`

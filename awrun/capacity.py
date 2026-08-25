@@ -69,7 +69,8 @@ def assess(queued: int, runners: List[Dict[str, Any]],
             "want": want, "label": label}
 
 
-def provision(want: int, dry_run: bool = True) -> Dict[str, Any]:
+def provision(want: int, dry_run: bool = True,
+              label: str = "") -> Dict[str, Any]:
     """Ask the host to add ``want`` runners.
 
     Returns a dict always, so a caller never has to distinguish "no provider"
@@ -85,13 +86,71 @@ def provision(want: int, dry_run: bool = True) -> Dict[str, Any]:
                            "plugins.PROVISION_CAPACITY to create them, because "
                            "that needs a cloud account, a quota and a spend "
                            "gate this package must not carry.")}
-    res = plugins.call(plugins.PROVISION_CAPACITY, want, dry_run)
+    # LABEL IS PASSED THROUGH. Without it this grew the DEFAULT pool while
+    # assess() had measured a named one -- 17 instances were bought for an
+    # awnix backlog, joined the generic pool, and left awnix at 1 runner
+    # and 38 queued while every signal reported success. Older providers
+    # that take no label still work: the call falls back.
+    # Arity is asked of the SIGNATURE, never inferred from a TypeError:
+    # plugins.call catches every exception itself and returns None, so a
+    # try/except here can never fire -- the "fallback" silently turned every
+    # 2-arg provider into a no-op that still reported success. The self-test
+    # arm below is the only reason that did not ship.
+    fn = plugins.get(plugins.PROVISION_CAPACITY)
+    takes_label = True
+    try:
+        import inspect
+        prms = inspect.signature(fn).parameters
+        takes_label = len(prms) >= 3 or any(
+            q.kind in (q.VAR_POSITIONAL, q.VAR_KEYWORD) for q in prms.values())
+    except (TypeError, ValueError):
+        # Deliberate, and NOT a swallowed error: a C builtin or a functools
+        # wrapper has no readable signature, and the safe default there is to
+        # pass the label and let the provider reject it -- the alternative
+        # silently grows the DEFAULT pool, which is the whole defect this
+        # parameter exists to fix. Recorded rather than passed so the next
+        # reader can tell a decision from an oversight.
+        takes_label = True
+    if takes_label:
+        res = plugins.call(plugins.PROVISION_CAPACITY, want, dry_run, label)
+    else:
+        res = plugins.call(plugins.PROVISION_CAPACITY, want, dry_run)
     if not isinstance(res, dict):
         return {"added": 0, "provider": "registered",
                 "detail": "the provider returned no usable result"}
     res.setdefault("added", 0)
     res.setdefault("provider", "registered")
     return res
+
+
+
+def _reap_self_test(check):
+    """Arms for plan_reap. Split out so self_test stays readable."""
+    def old(i, busy=False, age=120):
+        return {"id": i, "busy": busy, "age_minutes": age}
+
+    # the trap: a freshly launched instance is idle and unregistered
+    r = plan_reap(0, [old("a", age=2), old("b", age=3), old("c", age=200)])
+    check("a" not in r["reap"] and "b" not in r["reap"],
+          "plan_reap NEVER reaps an instance too young to have registered")
+
+    # never shrink while work is waiting
+    r = plan_reap(5, [old("a"), old("b")])
+    check(r["reap"] == [] and "still queued" in r["reason"],
+          "plan_reap refuses to shrink while runs are queued")
+
+    # busy is never reaped -- that would lose the job and the money spent on it
+    r = plan_reap(0, [old("a", busy=True), old("b", busy=True)])
+    check(r["reap"] == [], "plan_reap never terminates a busy runner")
+
+    # the floor holds
+    r = plan_reap(0, [old("a")])
+    check(r["reap"] == [], "plan_reap keeps the floor at a single idle runner")
+
+    # and it DOES reap when it should, or the whole thing is decoration
+    r = plan_reap(0, [old(x) for x in "abcde"])
+    check(len(r["reap"]) == 4 and r["kept"] == 1,
+          "plan_reap gives back 4 of 5 idle runners at an empty queue")
 
 
 def self_test() -> int:
@@ -144,6 +203,30 @@ def self_test() -> int:
     plugins.register(plugins.PROVISION_CAPACITY,
                      lambda want, dry: {"added": want, "detail": "fake"})
     check(provision(2)["added"] == 2, "a registered provider is used")
+    check(provision(2, label="awnix")["added"] == 2,
+          "a provider taking only (want, dry) still works -- the label is a "
+          "fallback call, so an older host does not break")
+
+    # THE ARM THIS FILE EXISTS FOR. assess() has always taken a label and
+    # provision() did not, so awrun measured one pool and grew another: 17
+    # instances were bought for an awnix backlog carrying default labels,
+    # joined the generic pool, and left awnix at 1 runner and 38 queued -- with
+    # added=17 reported and every instance genuinely running. The money was
+    # spent, the work was untouched, and nothing anywhere said so.
+    seen = {}
+    plugins.register(plugins.PROVISION_CAPACITY,
+                     lambda want, dry, label="": seen.update(label=label)
+                     or {"added": want, "detail": "fake"})
+    provision(2, label="awnix")
+    check(seen.get("label") == "awnix",
+          "provision grows the pool it was ASKED about -- the label reaches "
+          "the provider")
+    verdict = assess(40, [{"busy": True}], label="awnix")
+    seen.clear()
+    provision(verdict["want"], label=verdict["label"])
+    check(seen.get("label") == "awnix",
+          "the label assess() measured is the label provision() grows: the "
+          "two halves cannot address different pools")
 
     # Silence the hook's own warning for this arm only. It is correct that a
     # broken provider logs a traceback -- but printing one inside a PASSING
@@ -166,5 +249,57 @@ def self_test() -> int:
     if bad:
         print(f"capacity self-test: {bad} case(s) FAILED")
         return 1
+    _reap_self_test(check)
     print("capacity self-test: all cases behaved correctly")
     return 0
+
+
+#: Never shrink below this many online runners in a pool, even at zero queue.
+#: A pool that reaps to nothing pays the full cold-start latency on the next job,
+#: and cold start here is minutes -- boot, agent install, registration.
+REAP_FLOOR = 1
+
+#: An instance younger than this is NEVER reaped. A freshly launched runner is
+#: idle and unregistered while it boots, so a reaper without this kills the
+#: capacity it just bought and loops -- billing for instances that never ran a
+#: job. This is the single rule that separates a reaper from a spend leak.
+REAP_MIN_AGE_MIN = 20
+
+#: Reap only when the queue is genuinely drained. Shrinking while work is waiting
+#: trades money for latency in the wrong direction.
+REAP_MAX_QUEUED = 0
+
+
+def plan_reap(queued: int, candidates, floor: int = REAP_FLOOR,
+              min_age_minutes: int = REAP_MIN_AGE_MIN,
+              max_queued: int = REAP_MAX_QUEUED):
+    """Which instances to give back. PURE -- no API calls, no clock.
+
+    ``candidates`` is a list of dicts: {"id", "busy", "age_minutes", "online"}.
+    Returns {"reap": [ids], "kept": n, "reason": str}.
+
+    Refuses in every ambiguous direction, because the cost of over-reaping
+    (killing a runner mid-job, or thrashing new instances) is worse than the cost
+    of holding one extra box for an hour.
+    """
+    if queued > max_queued:
+        return {"reap": [], "kept": len(candidates),
+                "reason": f"{queued} run(s) still queued -- not shrinking while "
+                          f"work is waiting"}
+
+    # busy is never reaped: terminating a runner mid-job loses the job AND the
+    # money already spent on it.
+    idle = [c for c in candidates if not c.get("busy")]
+
+    # too young to have registered -- see REAP_MIN_AGE_MIN
+    old_enough = [c for c in idle
+                  if (c.get("age_minutes") or 0) >= min_age_minutes]
+    too_young = len(idle) - len(old_enough)
+
+    keep = max(0, floor - (len(candidates) - len(old_enough)))
+    reap = [c["id"] for c in old_enough[keep:]] if keep < len(old_enough) else []
+
+    reason = (f"queue drained; {len(candidates)} candidate(s), {len(idle)} idle, "
+              f"{too_young} too young to reap (<{min_age_minutes}m), "
+              f"floor {floor}")
+    return {"reap": reap, "kept": len(candidates) - len(reap), "reason": reason}
