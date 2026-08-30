@@ -353,9 +353,9 @@ def _self_test() -> int:
               rc4 == 0)
 
     # The capacity decision runs HERE, not only under its own import. A
-    # self-test that nothing invokes is documentation (HYG001): `awrun
-    # self-test` is the command anyone actually types, so a rule not reachable
-    # from it is a rule nobody has watched fail.
+    # self-test that nothing invokes is documentation, not enforcement:
+    # `awrun self-test` is the command anyone actually types, so a rule not
+    # reachable from it is a rule nobody has watched fail.
     from . import capacity as _cap
     if _cap.self_test() != 0:
         ok = False
