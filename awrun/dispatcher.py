@@ -186,7 +186,24 @@ def _real_run_comet_deploy(item: RunItem) -> tuple[int, str]:
     except json.JSONDecodeError as exc:
         return 1, f"AitherComet /deploy returned non-JSON: {exc}"
     status = str(payload.get("status", "")).lower()
-    code = 0 if status in ("success", "deployed", "running", "completed") else 1
+    # Judged against AitherComet's OWN DeploymentStatus enum, not a guess at it.
+    # This list read ("success", "deployed", "running", "completed") and the enum
+    # is {pending, in_progress, succeeded, failed, rolled_back, cancelled} -- so
+    # NOT ONE of the four accepted strings could ever be returned, and every
+    # comet-deploy was reported failed no matter what happened. Measured
+    # 2026-09-05 on the first deploy that ever worked:
+    #     awrun:  r-tjeb5s6p: failed
+    #     Comet:  {"status": "succeeded", "message": "Successfully deployed ..."}
+    #     podman: comet-lane-probe | Up 30 seconds
+    # A wrapper that can only ever say "failed" is worse than no wrapper: it
+    # would have kept saying failed after the deploy started working, which is
+    # exactly what it did tonight for three fixes in a row.
+    #
+    # `in_progress`/`pending` are NOT success -- /deploy is answering that the
+    # work is still going, and reporting that as done would be the same lie
+    # pointed the other way. They stay a non-zero code so the run is not closed
+    # out early.
+    code = 0 if status == "succeeded" else 1
     return code, json.dumps(payload)[:4000]
 
 
