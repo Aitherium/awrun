@@ -282,10 +282,26 @@ def plan_reap(queued: int, candidates, floor: int = REAP_FLOOR,
     (killing a runner mid-job, or thrashing new instances) is worse than the cost
     of holding one extra box for an hour.
     """
-    if queued > max_queued:
+    # SURPLUS, not an empty queue. This was `queued > max_queued` with
+    # max_queued=0, i.e. reap only when NOTHING is queued -- and this repo takes a
+    # commit every 2-5 minutes across ~15 active branches, so the queue is never
+    # zero and the reaper could never fire. Measured 2026-09-05: 23 runners
+    # online at ~$0.34/hr each with a reaper that was complete, correct, and
+    # unreachable. A refusal that can never lift is indistinguishable from an
+    # absent feature, except that it reads as deliberate safety.
+    #
+    # The safe quantity is the SURPLUS: idle runners beyond what the queue could
+    # possibly claim. If 5 are idle and 2 runs are queued, at most 2 idle runners
+    # are about to be taken and 3 are genuinely spare. Reaping a runner that work
+    # is waiting for is the failure this guards against, and surplus expresses it
+    # exactly, where "queue must be empty" merely approximates it into never.
+    idle_now = [c for c in candidates if not c.get("busy") and c.get("online", True)]
+    surplus = len(idle_now) - max(0, queued)
+    if surplus <= 0:
         return {"reap": [], "kept": len(candidates),
-                "reason": f"{queued} run(s) still queued -- not shrinking while "
-                          f"work is waiting"}
+                "reason": f"{queued} run(s) queued against {len(idle_now)} idle "
+                          f"runner(s) -- no surplus, not shrinking while work is "
+                          f"waiting"}
 
     # busy is never reaped: terminating a runner mid-job loses the job AND the
     # money already spent on it.
@@ -298,6 +314,9 @@ def plan_reap(queued: int, candidates, floor: int = REAP_FLOOR,
 
     keep = max(0, floor - (len(candidates) - len(old_enough)))
     reap = [c["id"] for c in old_enough[keep:]] if keep < len(old_enough) else []
+    # Never give back more than the measured surplus, however many are old enough:
+    # the age test says "safe to terminate", the surplus says "not needed".
+    reap = reap[:surplus]
 
     reason = (f"queue drained; {len(candidates)} candidate(s), {len(idle)} idle, "
               f"{too_young} too young to reap (<{min_age_minutes}m), "
