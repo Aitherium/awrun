@@ -78,6 +78,7 @@
     { id: "awembed", label: "awembed", blurb: "Train an embedding model that knows your..." },
     { id: "awtax", label: "awtax", blurb: "Turn any tax PDF -- returns, W-2, 1099,..." },
     { id: "awsettings", label: "awsettings", blurb: "Your agent's permissions and config,..." },
+    { id: "gawbbonet", label: "gawbbonet", blurb: "GobboNet campaigns with a real agent brain..." },
 ];
 
   var CSS = [
