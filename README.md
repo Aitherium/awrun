@@ -16,7 +16,7 @@ end-to-end (no GitHub Actions involvement at all), and ad-hoc
 finally something a human or an agent can steer while it's in flight.
 
 ```bash
-pip install -e AitherOS/packages/awrun
+pip install awrun
 ```
 
 Python 3.10+. No hard dependencies for the core queue.
@@ -78,7 +78,7 @@ urgent item can jump.
 ## Verification
 
 ```bash
-python -m pytest AitherOS/packages/awrun/tests/
+python -m pytest tests/
 python -m awrun.cli self-test
 python -m awrun.dispatcher --self-test
 ```
