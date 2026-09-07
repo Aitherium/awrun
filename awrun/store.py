@@ -60,7 +60,19 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
 #: "comet-deploy" added for Phase 7 (the one cloud-facing kind: a thin
 #: passthrough to AitherComet's own /deploy, which already tenant-scopes and
 #: cost-gates -- see dispatcher.py's _run_comet_deploy).
-KINDS = ("agent", "ci", "comet-deploy")
+#: `render` (2026-09-03): a media render claimed by a host-registered RunFn
+#: (`awrun_render_worker.py`) -- the WebMCP Design Studio's render-video lane.
+#: The queue knows nothing about rendering; it only carries the kind so several
+#: renderer workers can claim from one queue.
+#: `artpack` (2026-09-05): one Dark Matters character spec to bake into a
+#: character_pack/ on an art node (`lib/compute/lambda_art_node.py` drains it).
+#: Host-registered like `render`: the queue carries the item; the node driver
+#: claims it. With no driver running, an `artpack` item waits in `queued/`.
+#: `solve` (2026-09-06): one ProblemSpec (awpredict.contracts) to play through a
+#: ProblemSession -- the general solver's unit of work. Host-registered like
+#: `render`: `awgym.gym.awrun_solve.run_solve` is the RunFn; the queue only carries
+#: the kind so the kernel/awsh can submit and any aitherd with awgym can claim.
+KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve")
 
 #: Ids are typed by humans ("awrun bump r-7f3a --priority 5"), so short and an
 #: unambiguous alphabet — no 0/o/1/l. Same convention as decisions/store.py.
