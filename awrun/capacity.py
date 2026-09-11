@@ -134,10 +134,17 @@ def _reap_self_test(check):
     check("a" not in r["reap"] and "b" not in r["reap"],
           "plan_reap NEVER reaps an instance too young to have registered")
 
-    # never shrink while work is waiting
+    # ARM THAT WAS BROKEN UNTIL 2026-09-10 (CRP001): a queue the idle runners
+    # can cover several times over is NOT a reason to hold every box.
+    r = plan_reap(2, [old(x) for x in "abcdefgh"])
+    check(len(r["reap"]) == 6 and r["kept"] == 2,
+          "plan_reap gives back the surplus (6 of 8 idle) with 2 runs queued -- "
+          "the queue can claim only 2")
+
+    # and it STILL refuses when the queue could claim every idle runner
     r = plan_reap(5, [old("a"), old("b")])
-    check(r["reap"] == [] and "still queued" in r["reason"],
-          "plan_reap refuses to shrink while runs are queued")
+    check(r["reap"] == [],
+          "plan_reap refuses when 5 queued runs can claim both idle runners")
 
     # busy is never reaped -- that would lose the job and the money spent on it
     r = plan_reap(0, [old("a", busy=True), old("b", busy=True)])
@@ -265,27 +272,41 @@ REAP_FLOOR = 1
 #: job. This is the single rule that separates a reaper from a spend leak.
 REAP_MIN_AGE_MIN = 20
 
-#: Reap only when the queue is genuinely drained. Shrinking while work is waiting
-#: trades money for latency in the wrong direction.
-REAP_MAX_QUEUED = 0
+#: There is deliberately NO "the queue must be empty" constant here. Until
+#: 2026-09-10 this file carried REAP_MAX_QUEUED = 0, so plan_reap refused
+#: whenever ANY run was queued -- and on this repo the queue is never empty
+#: (a commit every 2-5 minutes across ~15 active branches). The reaper was
+#: complete, tested, wired and STRUCTURALLY UNREACHABLE: 23 runners stayed
+#: online at ~$0.34/hr each while every surface reported a working autoscaler
+#: (CRP001, measured 2026-09-05). The property to assert is not "queue empty"
+#: but "capacity the queue cannot claim" -- see plan_reap.
 
 
 def plan_reap(queued: int, candidates, floor: int = REAP_FLOOR,
               min_age_minutes: int = REAP_MIN_AGE_MIN,
-              max_queued: int = REAP_MAX_QUEUED):
+              max_queued=None):
     """Which instances to give back. PURE -- no API calls, no clock.
 
     ``candidates`` is a list of dicts: {"id", "busy", "age_minutes", "online"}.
     Returns {"reap": [ids], "kept": n, "reason": str}.
 
-    Refuses in every ambiguous direction, because the cost of over-reaping
-    (killing a runner mid-job, or thrashing new instances) is worse than the cost
-    of holding one extra box for an hour.
+    Reaps the SURPLUS: idle runners the queue cannot claim, never below the
+    floor, never a busy one, never one too young to have registered.
+
+    The property is reachability of BOTH outcomes. The old rule was "reap when
+    the queue is drained"; on a busy repo that outcome never occurs, so the
+    decision function could only refuse -- and a guard that cannot lift is an
+    absent feature that reads as deliberate safety (CRP001). What the queue
+    can still claim stays untouchable: with N queued runs, keep min(N, idle)
+    of the idle runners, plus the floor on the whole pool.
+
+    ``max_queued`` is an optional caller-supplied brake kept for compatibility:
+    when set and exceeded, nothing is reaped at all.
     """
-    if queued > max_queued:
+    if max_queued is not None and queued > max_queued:
         return {"reap": [], "kept": len(candidates),
-                "reason": f"{queued} run(s) still queued -- not shrinking while "
-                          f"work is waiting"}
+                "reason": f"{queued} run(s) queued, over the caller's "
+                          f"max_queued={max_queued} -- not shrinking"}
 
     # busy is never reaped: terminating a runner mid-job loses the job AND the
     # money already spent on it.
@@ -296,10 +317,17 @@ def plan_reap(queued: int, candidates, floor: int = REAP_FLOOR,
                   if (c.get("age_minutes") or 0) >= min_age_minutes]
     too_young = len(idle) - len(old_enough)
 
-    keep = max(0, floor - (len(candidates) - len(old_enough)))
-    reap = [c["id"] for c in old_enough[keep:]] if keep < len(old_enough) else []
+    # What the queue can still claim is untouchable. With more queued runs
+    # than idle runners, EVERY idle runner is about to be taken.
+    claimable = min(queued, len(idle))
+    surplus = len(idle) - claimable
+    # The floor protects the POOL, so busy and too-young boxes count toward it.
+    cap = max(0, len(candidates) - floor)
+    reap_count = min(len(old_enough), surplus, cap)
+    reap = ([c["id"] for c in old_enough[len(old_enough) - reap_count:]]
+            if reap_count > 0 else [])
 
-    reason = (f"queue drained; {len(candidates)} candidate(s), {len(idle)} idle, "
-              f"{too_young} too young to reap (<{min_age_minutes}m), "
-              f"floor {floor}")
+    reason = (f"{len(candidates)} candidate(s), {len(idle)} idle "
+              f"({too_young} too young to reap, <{min_age_minutes}m), "
+              f"{queued} queued -> {claimable} claimable, floor {floor}")
     return {"reap": reap, "kept": len(candidates) - len(reap), "reason": reason}
