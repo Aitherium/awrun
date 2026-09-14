@@ -10,7 +10,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-dependencies = []
+# awbac is a HARD import in authz.py (the comet-deploy money gate builds a
+# Policy on every check); it is ours and on PyPI (0.1.0, Aitherium/awbac), so
+# it is a real dependency, not an extra. sync-awrun's test job died on
+# `ModuleNotFoundError: No module named 'awbac'` (2026-09-14) the first time
+# the runner had pip at all. awrelay stays optional: dispatcher guards it.
+# awdit likewise: authz.py appends and verifies the audit log through it
+# (run 34797337018 died on ModuleNotFoundError: No module named 'awdit' the
+# moment awbac was present). Ours, on PyPI (0.1.0, Aitherium/awdit).
+dependencies = ["awbac>=0.1.0", "awdit>=0.1.0"]
 
 [project.optional-dependencies]
 # `--kind ci` dispatch shells out to `gh`, so it needs no extra Python dep beyond
