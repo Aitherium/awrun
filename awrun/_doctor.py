@@ -19,11 +19,11 @@ import os
 import shutil
 import sys
 
-#: Frozen from AitherOS/config/ecosystem.yaml at generation time. A shipped
+#: Frozen from the Aither World registry at generation time. A shipped
 #: package cannot read the registry, and a doctor that guessed at the family
 #: would go stale in silence. Regenerate to update.
 SELF = 'awrun'
-FAMILY = ['awask', 'awbac', 'awbrain', 'awbrowse', 'awclassify', 'awdelphi', 'awdit', 'awevolve', 'awfind', 'awfocus', 'awgit', 'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpool', 'awpredict', 'awprism', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrena', 'awrepl', 'awresearch', 'awrise', 'awrouter', 'awrtifact', 'awscreen', 'awseal', 'awshare', 'awsprite', 'awswarm', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall']
+FAMILY = ['awask', 'awavatar', 'awbac', 'awbrain', 'awbrowse', 'awclassify', 'awdecide', 'awdelphi', 'awdit', 'awembed', 'awevolve', 'awfind', 'awflow', 'awfocus', 'awgit', 'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awpool', 'awpredict', 'awprism', 'awprove', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrena', 'awrepl', 'awreport', 'awresearch', 'awrise', 'awrouter', 'awrtifact', 'awscreen', 'awseal', 'awsettings', 'awshare', 'awsprite', 'awstorage', 'awswarm', 'awtax', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall', 'gawbbonet']
 PAIRS_WITH = ['adk', 'awevolve', 'awpool', 'awrelay', 'awrise']
 
 #: This brick's OWN config, read out of its source at generation time.
