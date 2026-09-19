@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awrun"
-version = "0.1.1"
+version = "0.1.2"
 description = "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds — real dynamic priority for the class of work we control, instead of GitHub Actions' opaque FIFO."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -47,6 +47,13 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501", "E402", "E741"]
+
+[tool.ruff.lint.isort]
+# The repo's python-quality gate runs ruff --isolated from the monorepo root, where
+# awrun is NOT first-party; with this package config it IS. The two then disagree on
+# a blank line between `import pytest` and `from awrun ...` and no layout satisfies
+# both. Same answer awevolve and awtoll settled on: agree with the gate that runs in CI.
+known-third-party = ["awrun"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -74,6 +74,61 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
 #: the kind so the kernel/awsh can submit and any aitherd with awgym can claim.
 KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve")
 
+#: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
+#: an item that does not say what it needs cannot be admitted by a GPU lease
+#: door, and "run it and see" is how a render walks onto a card with no free
+#: memory and dies eleven minutes in. Other kinds MAY carry one.
+GPU_KINDS = frozenset({"render", "artpack", "solve"})
+
+#: The priority classes a lease door arbitrates between, most urgent first.
+GPU_CLASSES = ("arc", "interactive_media", "chat", "training", "detection")
+
+_GPU_REQUIRED_KEYS = ("class", "vram_mb")
+_GPU_ALLOWED_KEYS = frozenset({"class", "vram_mb", "host_pref", "ttl_s", "backend"})
+_GPU_DEFAULT_TTL_S = 600
+
+
+def validate_gpu(kind: str, gpu: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Normalise a `gpu` request, or raise RunError saying exactly what is wrong.
+
+    Shape: ``{"class": <GPU_CLASSES>, "vram_mb": int > 0, "host_pref": str = "auto",
+    "ttl_s": int > 0 = 600}`` plus an optional ``"backend"`` name. Optional in
+    storage (an old item on disk with no `gpu` still loads); required at submit
+    for GPU_KINDS.
+    """
+    if gpu is None:
+        if kind in GPU_KINDS:
+            raise RunError(
+                f"kind={kind!r} runs on a GPU and needs a gpu request: "
+                f"gpu={{'class': one of {GPU_CLASSES}, 'vram_mb': <int>}} "
+                f"(optional: host_pref, ttl_s, backend)")
+        return None
+    if not isinstance(gpu, dict):
+        raise RunError(f"gpu must be a mapping, got {type(gpu).__name__}")
+    unknown = sorted(set(gpu) - _GPU_ALLOWED_KEYS)
+    if unknown:
+        raise RunError(f"gpu has unknown keys {unknown}; allowed: {sorted(_GPU_ALLOWED_KEYS)}")
+    missing = [k for k in _GPU_REQUIRED_KEYS if k not in gpu]
+    if missing:
+        raise RunError(f"gpu is missing required keys {missing}")
+    cls = gpu["class"]
+    if cls not in GPU_CLASSES:
+        raise RunError(f"gpu.class must be one of {GPU_CLASSES}, got {cls!r}")
+    out: dict[str, Any] = {"class": cls}
+    for key, default in (("vram_mb", None), ("ttl_s", _GPU_DEFAULT_TTL_S)):
+        value = gpu.get(key, default)
+        # bool is an int subclass; `vram_mb: true` is a typo, not one megabyte.
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RunError(f"gpu.{key} must be a positive integer, got {value!r}")
+        out[key] = value
+    for key, default in (("host_pref", "auto"), ("backend", "")):
+        value = gpu.get(key, default)
+        if not isinstance(value, str):
+            raise RunError(f"gpu.{key} must be a string, got {value!r}")
+        out[key] = value or default
+    return out
+
+
 #: Ids are typed by humans ("awrun bump r-7f3a --priority 5"), so short and an
 #: unambiguous alphabet — no 0/o/1/l. Same convention as decisions/store.py.
 _ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
@@ -106,6 +161,16 @@ class RunItem:
     paths: list[str] = field(default_factory=list)
     claimed_by: Optional[str] = None
     result: Optional[dict[str, Any]] = None
+    #: What this run needs from a GPU (see validate_gpu). None = not a GPU run.
+    gpu: Optional[dict[str, Any]] = None
+    #: Epoch seconds before which claim_next() will not hand this item out.
+    #: Set by requeue(); 0 = claimable now.
+    not_before: float = 0.0
+    #: How many times this item went back to queued/ (backoff input).
+    requeues: int = 0
+    #: Why it last went back -- the lease door's own words (reason, lanes,
+    #: card id), so `awrun queue` can say what it is waiting for.
+    wait: Optional[dict[str, Any]] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -158,9 +223,16 @@ class RunStore:
         os.replace(tmp, target)
 
     def submit(self, kind: str, spec: dict[str, Any], *,
-               priority: int = 0, paths: Optional[list[str]] = None) -> RunItem:
+               priority: int = 0, paths: Optional[list[str]] = None,
+               gpu: Optional[dict[str, Any]] = None) -> RunItem:
         if kind not in KINDS:
             raise RunError(f"kind must be one of {KINDS}, got {kind!r}")
+        # `gpu=` wins; a submitter that can only send a spec (an HTTP body, a
+        # CLI --spec-json) may carry it as spec["gpu"] instead. Validated
+        # BEFORE an id is minted, so a refused submit leaves nothing on disk.
+        if gpu is None and isinstance(spec, dict):
+            gpu = spec.get("gpu")
+        gpu = validate_gpu(kind, gpu)
         for _ in range(50):
             candidate = _new_id()
             if self._locate(candidate) is None:
@@ -168,7 +240,7 @@ class RunStore:
         else:
             raise RunError("could not mint an unused run id")
         item = RunItem(id=candidate, kind=kind, spec=dict(spec), priority=priority,
-                        status=STATUS_QUEUED, paths=list(paths or []))
+                        status=STATUS_QUEUED, paths=list(paths or []), gpu=gpu)
         self._write(STATUS_QUEUED, item)
         return item
 
@@ -230,15 +302,25 @@ class RunStore:
         return self._move(item_id, STATUS_QUEUED, STATUS_CLAIMED, mutate=_set_claimant)
 
     def claim_next(self, *, worker_id: str, kind: Optional[str] = None,
-                   skip: Optional[Callable[[RunItem], bool]] = None) -> Optional[RunItem]:
+                   skip: Optional[Callable[[RunItem], bool]] = None,
+                   now: Optional[float] = None) -> Optional[RunItem]:
         """Claim the single highest-priority queued item, retrying the next
         candidate if a race loses the top one, or if `skip` says this
         particular item is not claimable right now (Phase 4: an item whose
         `paths` collide with a peer's live awgit lease). `skip` returning
         True does NOT remove the item from the queue -- it is tried again on
         the next dispatch cycle, once the lease has cleared. Returns None
-        only when nothing claimable remains after both checks."""
+        only when nothing claimable remains after both checks.
+
+        An item whose `not_before` is still in the future (requeue() put it
+        back with a backoff) is passed over the same way: it stays queued and
+        a lower-priority item may run ahead of it meanwhile -- a run waiting
+        on a busy GPU must not idle the whole queue. `now` is injectable for
+        tests only."""
+        at = time.time() if now is None else now
         for item in self.list(statuses=[STATUS_QUEUED], kind=kind):
+            if item.not_before and item.not_before > at:
+                continue
             if skip is not None and skip(item):
                 continue
             claimed = self.claim(item.id, worker_id=worker_id)
@@ -258,6 +340,38 @@ class RunStore:
             item.result = result
 
         return self._move(item_id, STATUS_RUNNING, status, mutate=_set_result)
+
+    def requeue(self, item_id: str, not_before: float, *,
+                wait: Optional[dict[str, Any]] = None) -> Optional[RunItem]:
+        """Put a CLAIMED or RUNNING item back in queued/, not claimable before
+        `not_before` (epoch seconds). This is "not now", never "failed": the
+        item keeps its id, priority and age, loses its claimant, and counts
+        the trip in `requeues`. `wait` records why (a lease door's refusal).
+
+        Returns None when the item is no longer claimed/running under this id
+        -- cancelled meanwhile, or requeued by someone else -- which is a lost
+        race, not an error. Requeueing a queued or closed item is an error:
+        the first is a no-op that would silently reset a backoff, the second
+        would rewrite history."""
+        located = self._locate(item_id)
+        if located is None:
+            raise RunError(f"no such run: {item_id}")
+        status, _ = located
+        if status not in (STATUS_CLAIMED, STATUS_RUNNING):
+            raise RunError(f"run {item_id} is {status}, only a claimed or running "
+                           f"run can be requeued")
+        try:
+            when = float(not_before)
+        except (TypeError, ValueError):
+            raise RunError(f"not_before must be epoch seconds, got {not_before!r}") from None
+
+        def _back(item: RunItem) -> None:
+            item.claimed_by = None
+            item.not_before = when
+            item.requeues = int(item.requeues or 0) + 1
+            item.wait = wait
+
+        return self._move(item_id, status, STATUS_QUEUED, mutate=_back)
 
     def cancel(self, item_id: str) -> Optional[RunItem]:
         located = self._locate(item_id)

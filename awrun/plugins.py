@@ -32,6 +32,14 @@ PROVISION_CAPACITY = "provision_capacity"
 #: it launches bills until something hands it back.
 REAP_CAPACITY = "reap_capacity"
 
+#: () -> a GPU lease client: any object exposing `acquire`, `heartbeat`,
+#: `release`, `LeaseRefused` and `LeaseUnavailable` (the shape of
+#: `awrun.gpu_lease`). A host that already owns a lease client -- its own door
+#: discovery, its own trust store -- registers it here; with nothing registered
+#: the dispatcher uses `awrun.gpu_lease`, which asks the door named by the
+#: environment and reports "no door" when there is none.
+GPU_LEASE_CLIENT = "gpu_lease_client"
+
 #: Why the host provisioner failed to import, when it did. None means it was
 #: never attempted or it succeeded. Recorded rather than swallowed: a silent
 #: ImportError leaves `awrun capacity --add` exiting 0 having done nothing,

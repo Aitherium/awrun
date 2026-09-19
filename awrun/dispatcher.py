@@ -41,13 +41,14 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-from awrun.store import RunItem, RunStore, get_store
+from awrun.store import GPU_KINDS, RunItem, RunStore, get_store
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,136 @@ def _broadcast(item: RunItem, event: str, *, client=None) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# kind=render | artpack | solve — host-registered; awrun ships NO executor
+# ─────────────────────────────────────────────────────────────────────────
+
+def _host_registered_gap(kind: str, what: str) -> RunFn:
+    """These kinds carry work awrun cannot do itself (a renderer, an art node, a
+    solver -- each a large system with its own dependencies). The honest built-in
+    is therefore a FAILURE that names the gap, never a pass: a queue that reported
+    `done` for a render nobody rendered would be worse than no queue.
+
+    A host supplies the real one: `dispatch_once(..., run_fns={**_RUN_FNS, kind: fn})`.
+    """
+    def _not_implemented(item: RunItem) -> tuple[int, str]:
+        return 1, (f"NotImplemented: awrun has no built-in executor for kind={kind!r} "
+                   f"({what}). This dispatcher was started without a host-registered "
+                   f"handler for it -- start the worker that owns this kind, or pass "
+                   f"run_fns={{{kind!r}: <fn>}} to dispatch_once()/run_forever(). "
+                   f"Nothing was executed for {item.id}.")
+    _not_implemented.awrun_not_implemented = True  # type: ignore[attr-defined]
+    return _not_implemented
+
+
+_real_run_render = _host_registered_gap("render", "a media render")
+_real_run_artpack = _host_registered_gap("artpack", "a character art pack bake")
+_real_run_solve = _host_registered_gap("solve", "a problem-solving session")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# GPU lease — ask the door before a gpu item touches the card
+# ─────────────────────────────────────────────────────────────────────────
+
+_LEASE_HEARTBEAT_S = 20.0
+_LEASE_BACKOFF_FLOOR_S = 15.0
+_LEASE_BACKOFF_CAP_S = 900.0
+
+
+def _lease_client(explicit=None):
+    """explicit argument > host-registered plugin > the built-in stdlib client."""
+    if explicit is not None:
+        return explicit
+    from awrun import plugins
+    hook = plugins.get(plugins.GPU_LEASE_CLIENT)
+    if hook is not None:
+        try:
+            client = hook()
+        except Exception as exc:  # noqa: BLE001 - a broken host hook must not stop dispatch
+            logger.warning("awrun: the registered GPU lease client hook raised (%s); "
+                           "using the built-in client", exc)
+            client = None
+        if client is not None:
+            return client
+    from awrun import gpu_lease
+    return gpu_lease
+
+
+def _lease_backoff_s(requeues: int, busy_retry_ms: object) -> float:
+    """The door's own estimate when it gave one, doubled per trip already made,
+    capped -- a run refused ten times must still be looked at again within
+    fifteen minutes, because the card may have drained without telling anyone."""
+    retry_ms = busy_retry_ms if isinstance(busy_retry_ms, (int, float)) \
+        and not isinstance(busy_retry_ms, bool) else 0
+    base = max(_LEASE_BACKOFF_FLOOR_S, retry_ms / 1000.0)
+    return min(_LEASE_BACKOFF_CAP_S, base * (2 ** max(0, min(int(requeues or 0), 10))))
+
+
+def _refusal_record(exc: Exception) -> dict:
+    to_json = getattr(exc, "to_json", None)
+    try:
+        record = dict(to_json()) if callable(to_json) else {}
+    except Exception:  # noqa: BLE001 - a refusal with a broken serializer is still a refusal
+        record = {}
+    record.setdefault("lease_refused", True)
+    record.setdefault("reason", str(getattr(exc, "reason", "") or exc))
+    return record
+
+
+def _declared_exc(client, name: str) -> tuple:
+    """The exception class a lease client declares under `name`, as a tuple an
+    `except` can take -- empty when it declares none, or declares something
+    that is not an exception class (an `except <non-class>` raises TypeError
+    at the moment a real exception is propagating, which would strand the
+    claimed item)."""
+    declared = getattr(client, name, None)
+    if isinstance(declared, type) and issubclass(declared, BaseException):
+        return (declared,)
+    return ()
+
+
+def _is_refusal(exc: BaseException, client) -> bool:
+    """Was this exception the door saying NO? By the client's declared class
+    when it declares one, else by shape: a host client that raises its own
+    `LeaseRefused` without exposing the class on the object must still be read
+    as a refusal -- the alternative is running the job anyway, which is the
+    one outcome a refusal may never have."""
+    if isinstance(exc, _declared_exc(client, "LeaseRefused")):
+        return True
+    if type(exc).__name__ == "LeaseRefused":
+        return True
+    return bool(getattr(exc, "lease_refused", False))
+
+
+def _is_unavailable(exc: BaseException, client) -> bool:
+    return isinstance(exc, _declared_exc(client, "LeaseUnavailable")) \
+        or type(exc).__name__ == "LeaseUnavailable"
+
+
+class _Heartbeat:
+    """Keeps a granted lease alive while the run function blocks."""
+
+    def __init__(self, client, lease) -> None:
+        self._client, self._lease = client, lease
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._beat, name="awrun-gpu-lease-beat",
+                                        daemon=True)
+        self._thread.start()
+
+    def _beat(self) -> None:
+        while not self._stop.wait(_LEASE_HEARTBEAT_S):
+            try:
+                self._client.heartbeat(self._lease)
+            except Exception as exc:  # noqa: BLE001 - the door's TTL is the backstop
+                logger.warning("awrun: gpu lease heartbeat failed: %s", exc)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # dispatch
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -368,23 +499,33 @@ _RUN_FNS: dict[str, RunFn] = {
     "agent": _real_run_agent,
     "ci": _real_run_ci,
     "comet-deploy": _real_run_comet_deploy,
+    "render": _real_run_render,
+    "artpack": _real_run_artpack,
+    "solve": _real_run_solve,
 }
 
 
 def dispatch_once(store: RunStore, *, worker_id: str,
                    run_fns: Optional[dict[str, RunFn]] = None,
-                   relay_client=None) -> Optional[RunItem]:
+                   relay_client=None, lease_client=None,
+                   now_fn: Callable[[], float] = time.time) -> Optional[RunItem]:
     """Claim and run the single highest-priority queued item, of ANY kind.
     Returns the finished item, or None if there was nothing claimable —
     that is the ordinary "queue is empty" (or "everything claimable is
-    lease-blocked") outcome, not an error."""
+    lease-blocked") outcome, not an error.
+
+    An item carrying a `gpu` request asks a GPU lease door first
+    (`lease_client`, else the registered plugin, else `awrun.gpu_lease`):
+    granted -> run, heartbeat, release exactly once; REFUSED -> the item goes
+    back to queued/ with a backoff and is RETURNED with status "queued" (never
+    failed, never run anyway); door unreachable -> run unleased, loudly."""
     fns = run_fns if run_fns is not None else _RUN_FNS
     actor = os.environ.get("AITHER_ACTOR") or f"awrun:{worker_id}"
 
     def _skip(item: RunItem) -> bool:
         return item.kind == "agent" and _lease_blocked(item, actor=actor)
 
-    claimed = store.claim_next(worker_id=worker_id, skip=_skip)
+    claimed = store.claim_next(worker_id=worker_id, skip=_skip, now=now_fn())
     if claimed is None:
         return None
     _broadcast(claimed, "claimed", client=relay_client)
@@ -394,22 +535,118 @@ def dispatch_once(store: RunStore, *, worker_id: str,
         if lease_error is not None:
             # Lost the race between the peek and the acquire -- put it back
             # rather than fail it; this is routine contention, not a defect.
-            return store.finish(claimed.id, status="failed",
-                                 result={"code": 1, "message": lease_error})
+            # (This used to call finish(), which only moves a RUNNING item, so
+            # the claimed item was neither failed nor put back -- it was stranded.)
+            return store.requeue(claimed.id, now_fn() + _LEASE_BACKOFF_FLOOR_S,
+                                 wait={"reason": lease_error})
 
-    running = store.start(claimed.id)
-    if running is None:
-        # Lost to a cancel between claim and start -- nothing to run.
-        return None
-    _broadcast(running, "running", client=relay_client)
+    run_fn = fns.get(claimed.kind)
+    runnable = run_fn is not None and not getattr(run_fn, "awrun_not_implemented", False)
 
-    run_fn = fns.get(running.kind)
-    if run_fn is None:
-        code, message = 1, f"no run handler registered for kind={running.kind!r}"
-    else:
-        code, message = run_fn(running)
+    # ── GPU lease: asked BEFORE start, so a refusal is claimed -> queued ────
+    # Only when there is something to run: a lease taken for a handler that
+    # can only say "not implemented" would evict real work for nothing.
+    lease = None
+    lease_state: Optional[dict] = None
+    client = None
+    if runnable and claimed.kind in GPU_KINDS and not claimed.gpu:
+        # An item queued before `gpu` was required. It cannot be admitted (it
+        # never said what it needs) and must not be dropped; it runs, and says so.
+        logger.error("awrun: %s [%s] carries NO gpu request -- running it UNLEASED; "
+                     "resubmit such work with gpu={class, vram_mb}", claimed.id, claimed.kind)
+        lease_state = {"state": "unleased", "why": "item carries no gpu request"}
+    elif runnable and claimed.gpu:
+        gpu = claimed.gpu
+        client = _lease_client(lease_client)
+        try:
+            lease = client.acquire(
+                gpu.get("class"), int(gpu.get("vram_mb") or 0),
+                backend=str(gpu.get("backend") or ""),
+                host_pref=str(gpu.get("host_pref") or "auto"),
+                ttl_s=int(gpu.get("ttl_s") or 600),
+                job_ref=f"awrun:{claimed.id}", consumer_id=f"awrun:{worker_id}")
+        # One arm, sorted by SHAPE rather than `except <the client's declared
+        # class>`: a client that raises a refusal without exposing its class must
+        # still be read as a refusal (_is_refusal), never as "door broke, run anyway".
+        except Exception as exc:  # noqa: BLE001 - refused, unreachable, or a client that broke
+            if _is_refusal(exc, client):
+                # The door said NO. That is "not now" -- NEVER `failed`, and never
+                # "run anyway". Back to queued/ with a backoff; the refusal (lanes,
+                # decision-card id) rides along so the queue can show what it waits on.
+                record = _refusal_record(exc)
+                delay = _lease_backoff_s(claimed.requeues, record.get("busyRetryMs"))
+                back = store.requeue(claimed.id, now_fn() + delay, wait=record)
+                logger.warning("awrun: %s [%s] gpu lease REFUSED (%s) -- requeued, "
+                               "retry in %.0fs", claimed.id, claimed.kind,
+                               record.get("reason"), delay)
+                if back is not None:
+                    _broadcast(back, f"requeued: gpu lease refused ({record.get('reason')}), "
+                                     f"retry in {delay:.0f}s", client=relay_client)
+                return back
+            # Nobody said no and nobody said yes. The arbiter being down must not
+            # take the queue down -- run, but LOUDLY, and record it on the result.
+            kind_of = "UNREACHABLE" if _is_unavailable(exc, client) \
+                else f"client error {type(exc).__name__}"
+            logger.error("awrun: %s [%s] gpu lease door %s -- running UNLEASED "
+                         "(%s MB of class %s is NOT reserved): %s", claimed.id, claimed.kind,
+                         kind_of, gpu.get("vram_mb"), gpu.get("class"), exc)
+            lease_state = {"state": "unleased", "why": f"{kind_of}: {exc}"[:500]}
+        else:
+            lease_state = {"state": "granted", "host": getattr(lease, "host", ""),
+                           "granted_mb": getattr(lease, "granted_mb", 0)}
+
+    beat: Optional[_Heartbeat] = None
+    outcome = "failed"
+    code, message = 1, "the run did not complete"
+    try:
+        running = store.start(claimed.id)
+        if running is None:
+            # Lost to a cancel between claim and start -- nothing to run.
+            outcome = "cancelled"
+            return None
+        _broadcast(running, "running" if lease_state is None
+                   else f"running (gpu lease: {lease_state['state']})", client=relay_client)
+
+        if run_fn is None:
+            code, message = 1, f"no run handler registered for kind={running.kind!r}"
+        else:
+            if lease is not None:
+                beat = _Heartbeat(client, lease)
+                beat.start()
+                # In memory only -- finish() re-reads the item from disk, so the
+                # handler sees where the door placed it and nothing is persisted.
+                running.spec["_gpu_lease"] = {
+                    "granted": True, "host": getattr(lease, "host", ""),
+                    "backend_url": getattr(lease, "backend_url", ""),
+                    "granted_mb": getattr(lease, "granted_mb", 0)}
+            try:
+                code, message = run_fn(running)
+            except Exception as exc:  # noqa: BLE001 - a raising handler is a FAILED run,
+                # not an item stranded in running/ forever with its lease held.
+                logger.exception("awrun: run handler for %s raised", running.id)
+                code, message = 1, f"run handler raised {type(exc).__name__}: {exc}"[:4000]
+        outcome = "done" if code == 0 else "failed"
+    finally:
+        if beat is not None:
+            beat.stop()
+        if lease is not None:
+            # Exactly once, on done AND on fail AND on an interrupt.
+            released = False
+            try:
+                released = bool(client.release(lease, outcome))
+            except Exception as exc:  # noqa: BLE001 - never raise out of finally
+                logger.error("awrun: gpu lease release for %s raised: %s", claimed.id, exc)
+            if not released:
+                logger.error("awrun: gpu lease for %s was NOT confirmed released "
+                             "(the door's TTL will reclaim it)", claimed.id)
+            if lease_state is not None:
+                lease_state["released"] = released
+
     status = "done" if code == 0 else "failed"
-    finished = store.finish(running.id, status=status, result={"code": code, "message": message})
+    result = {"code": code, "message": message}
+    if lease_state is not None:
+        result["gpu_lease"] = lease_state
+    finished = store.finish(running.id, status=status, result=result)
     if finished is not None:
         _broadcast(finished, status, client=relay_client)
     return finished
@@ -418,15 +655,18 @@ def dispatch_once(store: RunStore, *, worker_id: str,
 def run_forever(store: RunStore, *, worker_id: str, poll_interval: float = 5.0,
                  run_fns: Optional[dict[str, RunFn]] = None,
                  sleep_fn: Callable[[float], None] = time.sleep,
-                 max_iterations: Optional[int] = None) -> int:
+                 max_iterations: Optional[int] = None, lease_client=None) -> int:
     """Loop dispatching one item at a time. `max_iterations` exists only for
     tests -- production callers leave it None and rely on the process being
     stopped externally (a scheduled task's own lifecycle, or a signal)."""
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
-        result = dispatch_once(store, worker_id=worker_id, run_fns=run_fns)
-        if result is None:
+        result = dispatch_once(store, worker_id=worker_id, run_fns=run_fns,
+                               lease_client=lease_client)
+        # A requeued item (gpu lease refused) is "nothing ran": sleep, or a queue
+        # holding only refused work would spin on the door.
+        if result is None or result.status == "queued":
             sleep_fn(poll_interval)
     return 0
 
@@ -578,6 +818,118 @@ def _self_test() -> int:
         finally:
             globals()["_lease_blocked"] = orig_lease_blocked
 
+    # ── GPU lease: refusal -> requeued (never failed); release exactly once ─
+    from awrun import gpu_lease as _gl
+    from awrun.store import RunError
+
+    class _Door:
+        """A lease client with no network: counts every call it receives."""
+        LeaseRefused = _gl.LeaseRefused
+        LeaseUnavailable = _gl.LeaseUnavailable
+
+        def __init__(self, mode: str) -> None:
+            self.mode, self.acquired, self.released = mode, [], []
+
+        def acquire(self, cls, vram_mb, **kw):
+            self.acquired.append((cls, vram_mb, kw))
+            if self.mode == "refuse":
+                raise _gl.LeaseRefused({"reason": "outranked", "need_mb": vram_mb,
+                                        "free_mb": 400, "host": "gpu-0",
+                                        "lanes": {"wait": {"eta_s": 42},
+                                                  "cloud_card": {"card_id": "d-9"}}})
+            if self.mode == "down":
+                raise _gl.LeaseUnavailable("no GPU lease door answered")
+            return _gl.Lease(token="tok", host="gpu-0", backend_url="http://backend",
+                             granted_mb=vram_mb, door="http://door")
+
+        def heartbeat(self, lease):
+            return True
+
+        def release(self, lease, outcome="done"):
+            self.released.append(outcome)
+            return True
+
+    gpu_req = {"class": "interactive_media", "vram_mb": 18000}
+    with tempfile.TemporaryDirectory() as td:
+        store = RunStore(td)
+        try:
+            store.submit("render", {"job": "x"})
+            check("a render with NO gpu request is refused at submit", False)
+        except RunError as exc:
+            check("a render with NO gpu request is refused at submit, naming the fix",
+                  "gpu" in str(exc) and not store.list())
+        ran: list[str] = []
+
+        def fake_render(item: RunItem) -> tuple[int, str]:
+            ran.append(item.id)
+            return 0, str(item.spec.get("_gpu_lease", {}).get("backend_url"))
+
+        clock = [1000.0]
+        item = store.submit("render", {"job": "x"}, gpu=gpu_req, priority=5)
+        door = _Door("refuse")
+        back = dispatch_once(store, worker_id="w1", run_fns={"render": fake_render},
+                             lease_client=door, now_fn=lambda: clock[0])
+        check("a REFUSED lease requeues the run -- status queued, NEVER failed",
+              back is not None and back.id == item.id and back.status == "queued"
+              and not store.list(statuses=["failed"]))
+        check("a refused run never executes and never releases a lease it does not hold",
+              ran == [] and door.released == [])
+        check("the requeue carries the door's eta as backoff, the lanes and the card id",
+              back is not None and back.not_before == 1042.0 and back.requeues == 1
+              and (back.wait or {}).get("card_id") == "d-9" and back.claimed_by is None)
+        check("a backed-off run is not claimable before not_before ...",
+              store.claim_next(worker_id="w1", now=1041.0) is None)
+        door_ok = _Door("grant")
+        clock[0] = 1043.0
+        # claim_next reads the wall clock; this item's not_before (1042) is long past.
+        done = dispatch_once(store, worker_id="w1", run_fns={"render": fake_render},
+                             lease_client=door_ok, now_fn=lambda: clock[0])
+        check("... and runs once the door grants, on the backend the lease named",
+              done is not None and done.status == "done" and ran == [item.id]
+              and done.result["message"] == "http://backend"
+              and done.result["gpu_lease"]["state"] == "granted")
+        check("a successful run releases EXACTLY once, outcome=done",
+              door_ok.released == ["done"])
+
+        store.submit("render", {"job": "y"}, gpu=gpu_req)
+        door_fail = _Door("grant")
+        failed = dispatch_once(store, worker_id="w1", lease_client=door_fail,
+                               run_fns={"render": lambda i: (1, "render crashed")})
+        check("a failing run releases EXACTLY once, outcome=failed",
+              failed is not None and failed.status == "failed"
+              and door_fail.released == ["failed"])
+
+        def raising(item: RunItem) -> tuple[int, str]:
+            raise ValueError("handler blew up")
+
+        store.submit("render", {"job": "z"}, gpu=gpu_req)
+        door_raise = _Door("grant")
+        raised = dispatch_once(store, worker_id="w1", lease_client=door_raise,
+                               run_fns={"render": raising})
+        check("a RAISING handler is a failed run with one release, not a stranded one",
+              raised is not None and raised.status == "failed"
+              and door_raise.released == ["failed"] and not store.list(statuses=["running"]))
+
+        store.submit("render", {"job": "u"}, gpu=gpu_req)
+        door_down = _Door("down")
+        unleased = dispatch_once(store, worker_id="w1", lease_client=door_down,
+                                 run_fns={"render": lambda i: (0, "ok")})
+        check("an UNREACHABLE door runs the item unleased and records that on the result",
+              unleased is not None and unleased.status == "done"
+              and unleased.result["gpu_lease"]["state"] == "unleased"
+              and door_down.released == [])
+
+        store.submit("solve", {"spec": {}}, gpu={"class": "arc", "vram_mb": 8000})
+        door_gap = _Door("grant")
+        gap = dispatch_once(store, worker_id="w1", lease_client=door_gap)
+        check("a gpu kind with no host handler FAILS naming the gap -- and takes no lease",
+              gap is not None and gap.status == "failed"
+              and "NotImplemented" in gap.result["message"] and door_gap.acquired == [])
+
+    check("refusal backoff doubles per trip and is capped",
+          _lease_backoff_s(0, None) == 15.0 and _lease_backoff_s(1, 42000) == 84.0
+          and _lease_backoff_s(50, 42000) == _LEASE_BACKOFF_CAP_S)
+
     # ── Phase 5: broadcast is best-effort and never raises ───────────────
     class _BoomClient:
         def channels(self):
@@ -616,7 +968,9 @@ def main() -> int:
             print("nothing to dispatch")
             return 0
         print(f"{result.id}: {result.status}")
-        return 0 if result.status == "done" else 1
+        # "queued" = a gpu lease was refused and the run went back with a
+        # backoff. That is the queue working, not a failed dispatch.
+        return 0 if result.status in ("done", "queued") else 1
 
     return run_forever(store, worker_id=args.worker_id, poll_interval=args.poll_interval)
 
