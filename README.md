@@ -75,6 +75,10 @@ urgent item can jump.
 | `agent` | `adk chat <agent> "<task>"` |
 | `ci` | `gh workflow run <workflow> --ref <ref> -f k=v...` |
 | `comet-deploy` | a POST to AitherComet's `/deploy`, tenant-scoped and cost-gated |
+| `render` | host-registered: a media render; the renderer passes its own `run_fns=` |
+| `artpack` | host-registered: a character art pack bake |
+| `solve` | host-registered: a problem-solving session |
+| `tunnel` | host-registered: expose or retire a public hostname on a plane (tunnel/pages/worker); submit is authz-gated like `comet-deploy` |
 
 > This section used to say `kind=agent` dispatch only, and list `kind=ci` among
 > "the next phases", while ci was implemented, routed and covered by a

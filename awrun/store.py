@@ -72,7 +72,11 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
 #: ProblemSession -- the general solver's unit of work. Host-registered like
 #: `render`: `awgym.gym.awrun_solve.run_solve` is the RunFn; the queue only carries
 #: the kind so the kernel/awsh can submit and any aitherd with awgym can claim.
-KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve")
+#: `tunnel` (2026-09-19): open or retire a PUBLIC hostname -- the thing the
+#: AitherTunnel plane does and no queue could ask for. Not a GPU kind. Authz-gated
+#: at submit like comet-deploy (a public surface is money and perimeter), and the
+#: executor lives outside awrun exactly like render/artpack/solve.
+KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease

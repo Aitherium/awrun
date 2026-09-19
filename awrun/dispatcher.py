@@ -7,7 +7,7 @@ task (matching `AitherOS/config/routines/*.yaml`'s existing pattern) or a
 one-shot `--once` invocation. One fewer always-on service is one fewer thing
 that can silently die without anyone noticing.
 
-Three kinds, three handlers, one dispatch loop:
+Seven kinds, seven handlers, one dispatch loop:
 
 * `agent`        — Phase 1 (done). `adk chat <agent> "<task>"`.
 * `ci`            — Phase 2 (done). `gh workflow run <workflow> --ref <ref> -f k=v...`.
@@ -15,6 +15,14 @@ Three kinds, three handlers, one dispatch loop:
   already tenant-scopes and cost-gates on the cloud-gpu path. Trust-plane
   gating (Phase 8) happens at SUBMIT time in `cli.py`, not here — an item
   already sitting in the queue was already authorized.
+* `render`, `artpack`, `solve` — host-registered. awrun ships NO executor for
+  them; the built-in handler is a failure that names the gap, and the worker
+  that owns the kind passes its own `run_fns=` (see `_host_registered_gap`).
+* `tunnel`        — host-registered too (2026-09-19). Spec:
+  `{"action": "expose"|"retire", "hostname": "<fqdn>", "origin": "<scheme>://<host>:<port>"
+  (required for expose, forbidden for retire), "plane": "tunnel"|"pages"|"worker"}`.
+  Submit is authz-gated (`awrun:submit:tunnel`) like comet-deploy: a public
+  hostname is perimeter. The executor is the tunnel plane's one writer, not awrun.
 
 Dispatch itself is priority-first across ALL kinds, not per-kind: the whole
 point of this package was one queue an urgent item can jump, and a dispatcher
@@ -386,6 +394,7 @@ def _host_registered_gap(kind: str, what: str) -> RunFn:
 _real_run_render = _host_registered_gap("render", "a media render")
 _real_run_artpack = _host_registered_gap("artpack", "a character art pack bake")
 _real_run_solve = _host_registered_gap("solve", "a problem-solving session")
+_real_run_tunnel = _host_registered_gap("tunnel", "opening or retiring a public hostname")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -502,6 +511,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "render": _real_run_render,
     "artpack": _real_run_artpack,
     "solve": _real_run_solve,
+    "tunnel": _real_run_tunnel,
 }
 
 

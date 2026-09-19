@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
-from awrun.store import CLOSED_STATUSES, RunError, RunItem, RunStore, get_store
+from awrun.store import CLOSED_STATUSES, KINDS, RunError, RunItem, RunStore, get_store
 
 #: The file whose presence identifies a monorepo checkout. Chosen because it is
 #: the very module the capacity provider needs, so the marker cannot drift away
@@ -125,36 +125,70 @@ def _submit_comet_deploy_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
-def _authorize_comet_deploy(spec: dict) -> Optional[str]:
-    """Phase 8: only comet-deploy is gated. Returns an error string on
-    denial, or None on success -- resolving, checking and auditing happen
-    together here so a caller cannot accidentally submit without all three.
-    Fails CLOSED at every step: no token, no resolution, no permission, or a
-    failed audit write are ALL refusals, never a silent allow."""
+def _authorize_gated(kind: str, spec: dict) -> Optional[str]:
+    """Phase 8 (generalised 2026-09-19): every kind in `authz.KIND_PERMISSIONS`
+    is gated -- comet-deploy (money) and tunnel (perimeter). Returns an error
+    string on denial, or None on success -- resolving, checking and auditing
+    happen together here so a caller cannot accidentally submit without all
+    three. Fails CLOSED at every step: no token, no resolution, no permission,
+    or a failed audit write are ALL refusals, never a silent allow."""
     from awrun import authz
 
+    permission = authz.KIND_PERMISSIONS[kind]
     token = os.getenv("AITHER_SESSION_BEARER", "").strip()
     subject_id = authz.resolve_session(token)
     if not subject_id:
-        authz.audit("comet-deploy-denied", reason="no resolved session",
-                     spec=spec)
-        return ("comet-deploy requires a resolved awiam session -- set "
+        authz.audit(f"{kind}-denied", reason="no resolved session", spec=spec)
+        return (f"{kind} requires a resolved awiam session -- set "
                 "AITHER_SESSION_BEARER to a valid session token")
 
-    decision = authz.check_permission(subject_id)
+    decision = authz.check_permission(subject_id, permission)
     if not decision:
-        authz.audit("comet-deploy-denied", subject=subject_id,
+        authz.audit(f"{kind}-denied", subject=subject_id,
                      reason=decision.reason, spec=spec)
-        return f"comet-deploy refused for {subject_id!r}: {decision.reason}"
+        return f"{kind} refused for {subject_id!r}: {decision.reason}"
 
-    record = authz.audit("comet-deploy-submitted", subject=subject_id,
+    record = authz.audit(f"{kind}-submitted", subject=subject_id,
                           reason=decision.reason, spec=spec)
     if record is None:
-        # Money-spend path fails closed if it can't be recorded -- an
-        # unaudited spend is not something this package will let through
+        # Money-spend / perimeter path fails closed if it can't be recorded --
+        # an unaudited spend is not something this package will let through
         # even though the authz decision itself was ALLOW.
-        return "comet-deploy refused: could not write the audit record (spend must be auditable)"
+        return f"{kind} refused: could not write the audit record (spend must be auditable)"
     return None
+
+
+def _authorize_comet_deploy(spec: dict) -> Optional[str]:
+    return _authorize_gated("comet-deploy", spec)
+
+
+_TUNNEL_ACTIONS = ("expose", "retire")
+_TUNNEL_PLANES = ("tunnel", "pages", "worker")
+
+
+def _submit_tunnel_spec(args: argparse.Namespace) -> dict:
+    """The `tunnel` RunItem spec, validated at submit so the queue never holds a
+    row the executor has to reject: expose needs an origin, retire forbids one."""
+    action = (getattr(args, "action", None) or "").strip()
+    hostname = (getattr(args, "hostname", None) or "").strip().lower()
+    origin = (getattr(args, "origin", None) or "").strip()
+    plane = (getattr(args, "plane", None) or "tunnel").strip()
+    if action not in _TUNNEL_ACTIONS:
+        raise RunError(f"--action must be one of {_TUNNEL_ACTIONS}, got {action!r}")
+    if not hostname or "." not in hostname or "/" in hostname or " " in hostname:
+        raise RunError(f"--hostname must be a bare FQDN, got {hostname!r}")
+    if plane not in _TUNNEL_PLANES:
+        raise RunError(f"--plane must be one of {_TUNNEL_PLANES}, got {plane!r}")
+    if action == "expose":
+        if "://" not in origin:
+            raise RunError("--origin is required for --action expose and must carry a "
+                           "scheme (http://host:port or https://host:port)")
+        spec = {"action": action, "hostname": hostname, "origin": origin, "plane": plane}
+    else:
+        if origin:
+            raise RunError("--origin is forbidden for --action retire")
+        spec = {"action": action, "hostname": hostname, "plane": plane}
+    return spec
 
 
 def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
@@ -184,6 +218,21 @@ def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
         if denial is not None:
             print(f"ERROR: {denial}", file=sys.stderr)
             return 1
+    elif args.kind == "tunnel":
+        try:
+            spec = _submit_tunnel_spec(args)
+        except RunError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        denial = _authorize_gated("tunnel", spec)
+        if denial is not None:
+            print(f"ERROR: {denial}", file=sys.stderr)
+            return 1
+    elif args.kind in ("render", "artpack", "solve"):
+        print(f"ERROR: --kind {args.kind} is host-registered: its owner submits it with "
+              f"the spec that worker understands (RunStore.submit), not this CLI",
+              file=sys.stderr)
+        return 2
     else:
         if not args.task:
             print("ERROR: --task is required for --kind agent", file=sys.stderr)
@@ -300,7 +349,7 @@ def _self_test() -> int:
         )
         old_env = {k: os.environ.pop(k, None) for k in
                    ("AITHER_SESSION_BEARER", "AWRUN_COMET_DEPLOY_OPERATORS",
-                    "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
+                    "AWRUN_TUNNEL_OPERATORS", "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
         try:
             rc = cmd_submit(no_token_args, store)
             check("comet-deploy submit with NO session token is refused (exit 1)", rc == 1)
@@ -335,6 +384,36 @@ def _self_test() -> int:
                   len(queued) == 1 and queued[0].spec.get("service_name") == "my-svc")
             check("audit recorded the ALLOWED submit too",
                   "comet-deploy-submitted" in audit_path.read_text())
+
+            # ── kind=tunnel: gated the same way, by a DIFFERENT operator list ──
+            tunnel_args = argparse.Namespace(
+                kind="tunnel", priority=0, paths=[], json=False,
+                action="expose", hostname="demo.example.com",
+                origin="http://aitheros-veil:3000", plane="tunnel",
+            )
+            os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
+            rc5 = cmd_submit(tunnel_args, store)
+            check("a comet-deploy operator is NOT thereby a tunnel operator (exit 1)",
+                  rc5 == 1 and "tunnel-denied" in audit_path.read_text())
+            os.environ["AWRUN_TUNNEL_OPERATORS"] = "ops-dave"
+            rc6 = cmd_submit(tunnel_args, store)
+            queued_t = store.list(statuses=["queued"], kind="tunnel")
+            check("a tunnel operator's expose reaches the queue with the decided spec shape",
+                  rc6 == 0 and len(queued_t) == 1 and queued_t[0].spec == {
+                      "action": "expose", "hostname": "demo.example.com",
+                      "origin": "http://aitheros-veil:3000", "plane": "tunnel"})
+            bad = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
+                                     action="retire", hostname="demo.example.com",
+                                     origin="http://x:1", plane="tunnel")
+            check("retire with an origin is refused at submit (exit 2), not queued",
+                  cmd_submit(bad, store) == 2
+                  and len(store.list(statuses=["queued"], kind="tunnel")) == 1)
+            bad2 = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
+                                      action="expose", hostname="demo.example.com",
+                                      origin="aitheros-veil:3000", plane="tunnel")
+            check("expose without a scheme on the origin is refused (exit 2)",
+                  cmd_submit(bad2, store) == 2)
+            os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
         finally:
             for k, v in old_env.items():
                 if v is not None:
@@ -383,7 +462,9 @@ def build_parser() -> argparse.ArgumentParser:
     json_flag.add_argument("--json", action="store_true", help="machine-readable output")
 
     submit = sub.add_parser("submit", help="queue a new run", parents=[json_flag])
-    submit.add_argument("--kind", choices=["agent", "ci", "comet-deploy"], required=True)
+    # choices come from store.KINDS, never a hand-kept list: measured 2026-09-19 the
+    # CLI could submit 3 of 6 kinds and filter by 2 of 6 (AWK004/AWK005).
+    submit.add_argument("--kind", choices=list(KINDS), required=True)
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--paths", nargs="*", default=[],
                          help="paths this run will touch (lease-awareness)")
@@ -404,6 +485,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--spec-json", dest="spec_json",
                          help="[kind=comet-deploy] full AitherComet DeployRequest body as "
                               "a JSON object; --service-name/--target override matching keys")
+    submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS),
+                         help="[kind=tunnel] expose a hostname, or retire it")
+    submit.add_argument("--hostname", help="[kind=tunnel] the public FQDN")
+    submit.add_argument("--origin", help="[kind=tunnel] scheme://host:port (expose only)")
+    submit.add_argument("--plane", choices=list(_TUNNEL_PLANES), default="tunnel",
+                         help="[kind=tunnel] which plane serves the hostname")
 
     bump = sub.add_parser("bump", help="change a queued/claimed run's priority",
                            parents=[json_flag])
@@ -413,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue = sub.add_parser("queue", help="list runs, highest priority first",
                             parents=[json_flag])
     queue.add_argument("--all", action="store_true", help="include done/failed/cancelled")
-    queue.add_argument("--kind", choices=["agent", "ci"])
+    queue.add_argument("--kind", choices=list(KINDS))
 
     status = sub.add_parser("status", help="one run in full", parents=[json_flag])
     status.add_argument("id")

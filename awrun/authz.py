@@ -20,10 +20,20 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-#: The one permission this whole module exists to gate. Not a general-purpose
-#: RBAC layer -- one string, one door, matching "strict only where money can
-#: be spent".
+#: The permissions this module gates -- one per kind that spends money or opens
+#: the perimeter. Still not a general-purpose RBAC layer: two strings, two doors.
+#: `tunnel` (2026-09-19): a public hostname is perimeter, so it is gated like a spend.
 COMET_DEPLOY_PERMISSION = "awrun:submit:comet-deploy"
+TUNNEL_PERMISSION = "awrun:submit:tunnel"
+KIND_PERMISSIONS: dict[str, str] = {
+    "comet-deploy": COMET_DEPLOY_PERMISSION,
+    "tunnel": TUNNEL_PERMISSION,
+}
+#: Who may submit each gated kind, one env var per kind (comma-separated subject ids).
+KIND_OPERATORS_ENV: dict[str, str] = {
+    "comet-deploy": "AWRUN_COMET_DEPLOY_OPERATORS",
+    "tunnel": "AWRUN_TUNNEL_OPERATORS",
+}
 
 
 def _iam_directory_path() -> Path:
@@ -60,6 +70,15 @@ def _policy():
         p = p.assign(operators[0], "comet-deploy-operator")
         for subject in operators[1:]:
             p = p.assign(subject, "comet-deploy-operator")
+    # Every other gated kind gets its own role from its own env var -- an operator
+    # who may deploy a container is not thereby someone who may open a hostname.
+    for kind, perm in KIND_PERMISSIONS.items():
+        if kind == "comet-deploy":
+            continue
+        p = p.role(f"{kind}-operator", [perm])
+        raw = os.getenv(KIND_OPERATORS_ENV[kind], "")
+        for subject in [s.strip() for s in raw.split(",") if s.strip()]:
+            p = p.assign(subject, f"{kind}-operator")
     return p
 
 
