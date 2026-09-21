@@ -126,11 +126,13 @@ def self_test() -> int:
             os.environ[_OPERATORS_ENV] = "ops-dave"
             check("operators named -> an unresolved local user is REFUSED",
                   "resolved session" in (guard("suspend", "r-2222") or ""))
+            judged_sessions = False
             try:
                 from awiam import Directory, Sessions, Subject
             except ImportError:
                 print("  -- identity brick absent: resolved-session cases not judged")
             else:
+                judged_sessions = True
                 directory = Directory(os.environ["AWRUN_IAM_DIRECTORY"])
                 directory.put(Subject(id="ops-dave", display="Dave"))
                 directory.put(Subject(id="mallory", display="M"))
@@ -144,7 +146,8 @@ def self_test() -> int:
                 text = log.read_text(encoding="utf-8")
                 check("the denial AND the allow are both on the record",
                       'run-suspend-denied"' in text and 'run-suspend"' in text
-                      and 'run-resume-denied"' in text and 'run-resume"' in text)
+                      and (not judged_sessions
+                           or ('run-resume-denied"' in text and 'run-resume"' in text)))
             os.environ.pop(_OPERATORS_ENV, None)
             os.environ.pop("AITHER_SESSION_BEARER", None)
             os.environ["AWRUN_AUDIT_LOG"] = str(Path(td) / "is-a-dir")

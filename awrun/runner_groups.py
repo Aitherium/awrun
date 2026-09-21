@@ -49,11 +49,34 @@ class RunnerGroupError(RuntimeError):
     """Something we could not do, stated plainly enough to act on."""
 
 
+def _vault_token() -> str:
+    """Inside the AitherOS fleet the token lives in the vault, not the environment
+    (the worker's env copy of GITHUB_TOKEN answers 401; the vault's answers 200 --
+    measured 2026-09-10 and again 2026-09-21, when the 5-minute autoscaler turned
+    out to have never run once). A stranger's machine has no such client; then
+    this is simply not a path and the env rule below stands."""
+    try:
+        from lib.clients.aither_secrets import get_secret  # in-fleet only
+    except Exception:  # noqa: BLE001 - no fleet client here
+        return ""
+    for name in ("GH_ORG_ADMIN_TOKEN", "GITHUB_TOKEN"):
+        try:
+            v = (get_secret(name) or "").strip()
+        except Exception:  # noqa: BLE001 - try the next name
+            continue
+        if v:
+            return v
+    return ""
+
+
 def _token() -> str:
     for var in ("GH_TOKEN", "GITHUB_TOKEN", "AWRUN_GH_TOKEN"):
         v = os.environ.get(var, "").strip()
         if v:
             return v
+    v = _vault_token()
+    if v:
+        return v
     raise RunnerGroupError(
         "no GitHub token: set GH_TOKEN (or GITHUB_TOKEN). It is read from the "
         "environment and never accepted as an argument, because an argv token "

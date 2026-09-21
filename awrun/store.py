@@ -38,6 +38,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -229,6 +230,29 @@ def validate_egress(egress: Optional[dict[str, Any]]) -> Optional[dict[str, Any]
     return out
 
 
+# -- a clock that never hands two submits the same instant ----------------------
+
+_clock_lock = threading.Lock()
+_last_created = 0.0
+
+
+def next_created_at() -> float:
+    """`time.time()`, made strictly increasing within this process.
+
+    Windows quantises the wall clock to ~15.6 ms (measured 2026-09-21: 2000
+    consecutive `time.time()` samples, all identical), so two submits in one tick
+    got the same `created_at` and the promised FIFO among equal priorities fell to
+    directory order -- random ids. Across processes the same tick is genuinely
+    unordered; `RunStore.list` then breaks the tie on id, deterministically."""
+    global _last_created
+    with _clock_lock:
+        now = time.time()
+        if now <= _last_created:
+            now = _last_created + 1e-6
+        _last_created = now
+        return now
+
+
 #: Ids are typed by humans ("awrun bump r-7f3a --priority 5"), so short and an
 #: unambiguous alphabet — no 0/o/1/l. Same convention as decisions/store.py.
 _ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
@@ -282,7 +306,7 @@ class RunItem:
     checkpoint: Optional[dict[str, Any]] = None
     #: How many times this run was resumed.
     resumes: int = 0
-    created_at: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=next_created_at)
     updated_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -648,7 +672,7 @@ class RunStore:
                 if kind is not None and item.kind != kind:
                     continue
                 items.append(item)
-        items.sort(key=lambda it: (-it.priority, it.created_at))
+        items.sort(key=lambda it: (-it.priority, it.created_at, it.id))
         return items
 
 

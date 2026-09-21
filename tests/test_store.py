@@ -308,3 +308,15 @@ def test_requeue_lost_race_returns_none_not_error(store, monkeypatch):
     assert store.requeue(item.id, 1.0) is None
     monkeypatch.setattr(store, "_locate", real_locate)
     assert store.get(item.id).status == STATUS_CANCELLED  # the cancel stood
+
+
+def test_submits_in_one_clock_tick_keep_fifo_order(store, monkeypatch):
+    """Windows quantises time.time() to ~15 ms; two submits in one tick must still
+    list in submit order, not directory order."""
+    from awrun import store as store_mod
+    monkeypatch.setattr(store_mod.time, "time", lambda: 1_700_000_000.0)   # frozen clock
+    ids = [store.submit("agent", {"task": str(i)}, priority=5).id for i in range(25)]
+    listed = [i.id for i in store.list(statuses=[STATUS_QUEUED])]
+    assert listed == ids
+    ages = [store.get(i).created_at for i in ids]
+    assert ages == sorted(ages) and len(set(ages)) == len(ages)

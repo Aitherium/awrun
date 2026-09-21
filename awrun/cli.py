@@ -647,59 +647,69 @@ def _self_test() -> int:
             check("...and the no-token denial went to the SCRATCH trail",
                   audit_path.exists() and "comet-deploy-denied" in audit_path.read_text())
 
-            from awiam import Directory, Sessions, Subject
-            directory = Directory(str(iam_path))
-            directory.put(Subject(id="ops-dave", display="Dave"))
-            token = Sessions(directory).issue("ops-dave")
-            os.environ["AITHER_SESSION_BEARER"] = token or ""
+            try:
+                from awiam import Directory, Sessions, Subject
+                identity_brick = True
+            except ImportError:
+                identity_brick = False
+            if not identity_brick:
+                # A stranger with `pip install awrun` has no identity brick. The
+                # fail-closed half (no token -> refused) was judged above; the
+                # resolved-session half cannot be, and says so rather than dying.
+                print("  -- identity brick (awiam) absent: resolved-session cases not judged")
+            else:
+                directory = Directory(str(iam_path))
+                directory.put(Subject(id="ops-dave", display="Dave"))
+                token = Sessions(directory).issue("ops-dave")
+                os.environ["AITHER_SESSION_BEARER"] = token or ""
 
-            # Resolved session, but NOT in the operator allowlist.
-            os.environ.pop("AWRUN_COMET_DEPLOY_OPERATORS", None)
-            rc2 = cmd_submit(no_token_args, store)
-            check("a resolved session with NO comet-deploy permission is still refused",
-                  rc2 == 1)
-            check("...and audit recorded the denial",
-                  audit_path.exists() and "comet-deploy-denied" in audit_path.read_text())
+                # Resolved session, but NOT in the operator allowlist.
+                os.environ.pop("AWRUN_COMET_DEPLOY_OPERATORS", None)
+                rc2 = cmd_submit(no_token_args, store)
+                check("a resolved session with NO comet-deploy permission is still refused",
+                      rc2 == 1)
+                check("...and audit recorded the denial",
+                      audit_path.exists() and "comet-deploy-denied" in audit_path.read_text())
 
-            # Now grant the permission and retry the SAME submit.
-            os.environ["AWRUN_COMET_DEPLOY_OPERATORS"] = "ops-dave"
-            rc3 = cmd_submit(no_token_args, store)
-            check("a resolved session WITH the operator role succeeds (exit 0)", rc3 == 0)
-            queued = store.list(statuses=["queued"], kind="comet-deploy")
-            check("the comet-deploy item actually reached the queue",
-                  len(queued) == 1 and queued[0].spec.get("service_name") == "my-svc")
-            check("audit recorded the ALLOWED submit too",
-                  "comet-deploy-submitted" in audit_path.read_text())
+                # Now grant the permission and retry the SAME submit.
+                os.environ["AWRUN_COMET_DEPLOY_OPERATORS"] = "ops-dave"
+                rc3 = cmd_submit(no_token_args, store)
+                check("a resolved session WITH the operator role succeeds (exit 0)", rc3 == 0)
+                queued = store.list(statuses=["queued"], kind="comet-deploy")
+                check("the comet-deploy item actually reached the queue",
+                      len(queued) == 1 and queued[0].spec.get("service_name") == "my-svc")
+                check("audit recorded the ALLOWED submit too",
+                      "comet-deploy-submitted" in audit_path.read_text())
 
-            # ── kind=tunnel: gated the same way, by a DIFFERENT operator list ──
-            tunnel_args = argparse.Namespace(
-                kind="tunnel", priority=0, paths=[], json=False,
-                action="expose", hostname="demo.example.com",
-                origin="http://aitheros-veil:3000", plane="tunnel",
-            )
-            os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
-            rc5 = cmd_submit(tunnel_args, store)
-            check("a comet-deploy operator is NOT thereby a tunnel operator (exit 1)",
-                  rc5 == 1 and "tunnel-denied" in audit_path.read_text())
-            os.environ["AWRUN_TUNNEL_OPERATORS"] = "ops-dave"
-            rc6 = cmd_submit(tunnel_args, store)
-            queued_t = store.list(statuses=["queued"], kind="tunnel")
-            check("a tunnel operator's expose reaches the queue with the decided spec shape",
-                  rc6 == 0 and len(queued_t) == 1 and queued_t[0].spec == {
-                      "action": "expose", "hostname": "demo.example.com",
-                      "origin": "http://aitheros-veil:3000", "plane": "tunnel"})
+                # ── kind=tunnel: gated the same way, by a DIFFERENT operator list ──
+                tunnel_args = argparse.Namespace(
+                    kind="tunnel", priority=0, paths=[], json=False,
+                    action="expose", hostname="demo.example.com",
+                    origin="http://aitheros-veil:3000", plane="tunnel",
+                )
+                os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
+                rc5 = cmd_submit(tunnel_args, store)
+                check("a comet-deploy operator is NOT thereby a tunnel operator (exit 1)",
+                      rc5 == 1 and "tunnel-denied" in audit_path.read_text())
+                os.environ["AWRUN_TUNNEL_OPERATORS"] = "ops-dave"
+                rc6 = cmd_submit(tunnel_args, store)
+                queued_t = store.list(statuses=["queued"], kind="tunnel")
+                check("a tunnel operator's expose reaches the queue with the decided spec shape",
+                      rc6 == 0 and len(queued_t) == 1 and queued_t[0].spec == {
+                          "action": "expose", "hostname": "demo.example.com",
+                          "origin": "http://aitheros-veil:3000", "plane": "tunnel"})
             bad = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                      action="retire", hostname="demo.example.com",
                                      origin="http://x:1", plane="tunnel")
+            tunnels_before = len(store.list(statuses=["queued"], kind="tunnel"))
             check("retire with an origin is refused at submit (exit 2), not queued",
                   cmd_submit(bad, store) == 2
-                  and len(store.list(statuses=["queued"], kind="tunnel")) == 1)
+                  and len(store.list(statuses=["queued"], kind="tunnel")) == tunnels_before)
             bad2 = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                       action="expose", hostname="demo.example.com",
                                       origin="aitheros-veil:3000", plane="tunnel")
             check("expose without a scheme on the origin is refused (exit 2)",
                   cmd_submit(bad2, store) == 2)
-            os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
         finally:
             for k, v in old_env.items():
                 if v is not None:

@@ -8,6 +8,7 @@ the only thing that says whether finished work was done twice.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -59,8 +60,27 @@ def _calls(path: Path) -> list:
     return path.read_text(encoding="utf-8").split("\n")[:-1] if path.exists() else []
 
 
-@pytest.mark.skipif(not (AWFLOW_DIR / "awflow" / "__init__.py").is_file(),
-                    reason="the workflow engine is not alongside this package")
+def _child_pythonpath() -> str:
+    paths = [str(AWFLOW_DIR), str(HERE.parents[1]), os.environ.get("PYTHONPATH", "")]
+    return os.pathsep.join(p for p in paths if p)
+
+
+def _awflow_imports_in_a_child() -> bool:
+    """The flow runs in a CHILD process. The engine's directory being present is not
+    the same as the engine importing there: the publish lane installs this package
+    alone, so awflow's own dependencies are absent and the child dies on import
+    while the directory test says "present". Ask the child, not the filesystem."""
+    if not (AWFLOW_DIR / "awflow" / "__init__.py").is_file():
+        return False
+    env = dict(os.environ, PYTHONPATH=_child_pythonpath())
+    probe = subprocess.run([sys.executable, "-c", "import awflow"], env=env,
+                           capture_output=True, timeout=60, check=False)
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(not _awflow_imports_in_a_child(),
+                    reason="the workflow engine does not import in a child process here "
+                           "(not alongside this package, or its dependencies are absent)")
 def test_a_suspended_flow_resumes_without_redoing_finished_calls(tmp_path, monkeypatch):
     script = tmp_path / "flow_under_test.py"
     script.write_text(FLOW, encoding="utf-8")
@@ -68,8 +88,7 @@ def test_a_suspended_flow_resumes_without_redoing_finished_calls(tmp_path, monke
     monkeypatch.setenv("AWRUN_TEST_CALLS", str(calls))
     monkeypatch.setenv("AWRUN_FLOW_FAKE_DISPATCHER", "1")
     monkeypatch.setenv("AITHER_AWFLOW_MIRROR", "0")
-    paths = [str(AWFLOW_DIR), str(HERE.parents[1]), os.environ.get("PYTHONPATH", "")]
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(p for p in paths if p))
+    monkeypatch.setenv("PYTHONPATH", _child_pythonpath())
     monkeypatch.setattr(dispatcher, "_POLL_S", 0.1)
 
     store = RunStore(tmp_path / "q")
@@ -82,8 +101,16 @@ def test_a_suspended_flow_resumes_without_redoing_finished_calls(tmp_path, monke
 
     deadline = time.time() + 60
     while "do gamma" not in _calls(calls) and time.time() < deadline:
+        if not worker.is_alive():
+            break                       # the run finished (or failed) before gamma
         time.sleep(0.1)
-    assert _calls(calls) == ["do alpha", "do beta", "do gamma"], _calls(calls)
+    if _calls(calls) != ["do alpha", "do beta", "do gamma"]:
+        # Name the child's own failure: an empty call log is what "the flow could not
+        # start" looks like, and the run's result carries the stderr that says why.
+        worker.join(timeout=5)
+        early = store.get(item.id)
+        pytest.fail(f"calls={_calls(calls)} run={early.status if early else None} "
+                    f"result={(early.result or {}).get('message', '')[-600:] if early else ''}")
 
     assert store.suspend(item.id).status == "running"     # a request, not yet a state
     worker.join(timeout=60)
