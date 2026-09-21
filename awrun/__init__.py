@@ -24,4 +24,4 @@ __all__ = [
     "runs_dir",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
