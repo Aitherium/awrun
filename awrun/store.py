@@ -49,13 +49,17 @@ STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
+#: Parked on purpose: not claimable, not closed. A suspended run keeps its id,
+#: priority, age and `checkpoint`, and `resume()` puts it back in queued/.
+STATUS_SUSPENDED = "suspended"
 
 #: Every status has a directory. Order matters for _all_statuses() only in
 #: that it is deterministic, not that it means anything else.
-ALL_STATUSES = (STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
+ALL_STATUSES = (STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING, STATUS_SUSPENDED,
                 STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
 CLOSED_STATUSES = frozenset({STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED})
-OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
+OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
+                           STATUS_SUSPENDED})
 
 #: "comet-deploy" added for Phase 7 (the one cloud-facing kind: a thin
 #: passthrough to AitherComet's own /deploy, which already tenant-scopes and
@@ -76,7 +80,10 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING})
 #: AitherTunnel plane does and no queue could ask for. Not a GPU kind. Authz-gated
 #: at submit like comet-deploy (a public surface is money and perimeter), and the
 #: executor lives outside awrun exactly like render/artpack/solve.
-KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel")
+#: `flow` (2026-09-21): a journaled workflow (`module:function`, or a script path
+#: plus a function name). The run id IS the journal id, so a suspended flow
+#: resumes by replaying the calls it already made instead of making them again.
+KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease
@@ -133,6 +140,95 @@ def validate_gpu(kind: str, gpu: Optional[dict[str, Any]]) -> Optional[dict[str,
     return out
 
 
+# -- what a run is FOR, and what it may use ---------------------------------
+
+#: Why this run exists. Free-form ids owned by whoever plans the work; the queue
+#: only carries them so every run can be traced to what asked for it.
+LINEAGE_KEYS = ("intent", "goal", "expedition", "flow", "plan", "notebook", "parent_run")
+_LINEAGE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@#-]{0,199}$")
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_HOST_RE = re.compile(r"^(\*\.)?" + _LABEL + r"(\." + _LABEL + r")*(:\d{1,5})?$")
+_LIMIT_KEYS = frozenset({"timeout_s", "cpus", "memory_mb"})
+_EGRESS_KEYS = frozenset({"hosts", "proxy", "network"})
+
+
+def validate_name(name: Optional[str]) -> str:
+    """A run's declared name: what `apply` matches on, so applying the same
+    manifest twice converges instead of queueing a duplicate."""
+    if not name:
+        return ""
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise RunError(f"name must match {_NAME_RE.pattern}, got {name!r}")
+    return name
+
+
+def validate_lineage(lineage: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+    if lineage is None:
+        return None
+    if not isinstance(lineage, dict):
+        raise RunError(f"lineage must be a mapping, got {type(lineage).__name__}")
+    unknown = sorted(set(lineage) - set(LINEAGE_KEYS))
+    if unknown:
+        raise RunError(f"lineage has unknown keys {unknown}; allowed: {list(LINEAGE_KEYS)}")
+    out: dict[str, str] = {}
+    for key, value in lineage.items():
+        if not isinstance(value, str) or not _LINEAGE_VALUE_RE.match(value):
+            raise RunError(f"lineage.{key} must be a short id string, got {value!r}")
+        out[key] = value
+    return out or None
+
+
+def validate_limits(limits: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """``{"timeout_s": int, "cpus": number, "memory_mb": int}`` -- all optional,
+    all positive. A limit the runner cannot enforce makes the run FAIL at
+    dispatch; it is never quietly ignored."""
+    if limits is None:
+        return None
+    if not isinstance(limits, dict):
+        raise RunError(f"limits must be a mapping, got {type(limits).__name__}")
+    unknown = sorted(set(limits) - _LIMIT_KEYS)
+    if unknown:
+        raise RunError(f"limits has unknown keys {unknown}; allowed: {sorted(_LIMIT_KEYS)}")
+    out: dict[str, Any] = {}
+    for key, value in limits.items():
+        integral = key != "cpus"
+        okay = isinstance(value, int) if integral else isinstance(value, (int, float))
+        if isinstance(value, bool) or not okay or value <= 0:
+            want = "a positive integer" if integral else "a positive number"
+            raise RunError(f"limits.{key} must be {want}, got {value!r}")
+        out[key] = value
+    return out or None
+
+
+def validate_egress(egress: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """``{"hosts": [...], "proxy": url, "network": name}``. `hosts` is the whole
+    allowlist: ``[]`` means NO outbound traffic at all. Absent = unrestricted."""
+    if egress is None:
+        return None
+    if not isinstance(egress, dict):
+        raise RunError(f"egress must be a mapping, got {type(egress).__name__}")
+    unknown = sorted(set(egress) - _EGRESS_KEYS)
+    if unknown:
+        raise RunError(f"egress has unknown keys {unknown}; allowed: {sorted(_EGRESS_KEYS)}")
+    hosts = egress.get("hosts")
+    if not isinstance(hosts, list):
+        raise RunError("egress.hosts is required and must be a list ([] = no egress)")
+    clean: list[str] = []
+    for host in hosts:
+        if not isinstance(host, str) or not _HOST_RE.match(host.strip().lower()):
+            raise RunError(f"egress.hosts entry is not a host[:port]: {host!r}")
+        clean.append(host.strip().lower())
+    out: dict[str, Any] = {"hosts": sorted(set(clean))}
+    for key in ("proxy", "network"):
+        value = egress.get(key, "")
+        if not isinstance(value, str):
+            raise RunError(f"egress.{key} must be a string, got {value!r}")
+        if value:
+            out[key] = value
+    return out
+
+
 #: Ids are typed by humans ("awrun bump r-7f3a --priority 5"), so short and an
 #: unambiguous alphabet — no 0/o/1/l. Same convention as decisions/store.py.
 _ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
@@ -175,6 +271,17 @@ class RunItem:
     #: Why it last went back -- the lease door's own words (reason, lanes,
     #: card id), so `awrun queue` can say what it is waiting for.
     wait: Optional[dict[str, Any]] = None
+    #: Declared name (see validate_name). "" = anonymous.
+    name: str = ""
+    #: Why this run exists (see LINEAGE_KEYS).
+    lineage: Optional[dict[str, str]] = None
+    #: What it may use (see validate_limits / validate_egress).
+    limits: Optional[dict[str, Any]] = None
+    egress: Optional[dict[str, Any]] = None
+    #: What the runner needs to continue after a suspend. The queue never reads it.
+    checkpoint: Optional[dict[str, Any]] = None
+    #: How many times this run was resumed.
+    resumes: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -228,9 +335,19 @@ class RunStore:
 
     def submit(self, kind: str, spec: dict[str, Any], *,
                priority: int = 0, paths: Optional[list[str]] = None,
-               gpu: Optional[dict[str, Any]] = None) -> RunItem:
+               gpu: Optional[dict[str, Any]] = None, name: str = "",
+               lineage: Optional[dict[str, Any]] = None,
+               limits: Optional[dict[str, Any]] = None,
+               egress: Optional[dict[str, Any]] = None) -> RunItem:
         if kind not in KINDS:
             raise RunError(f"kind must be one of {KINDS}, got {kind!r}")
+        name = validate_name(name)
+        lineage = validate_lineage(lineage)
+        limits = validate_limits(limits)
+        egress = validate_egress(egress)
+        if name and self.find_by_name(name) is not None:
+            raise RunError(f"an open run is already named {name!r}; "
+                           f"use apply to converge it, or cancel it first")
         # `gpu=` wins; a submitter that can only send a spec (an HTTP body, a
         # CLI --spec-json) may carry it as spec["gpu"] instead. Validated
         # BEFORE an id is minted, so a refused submit leaves nothing on disk.
@@ -244,7 +361,8 @@ class RunStore:
         else:
             raise RunError("could not mint an unused run id")
         item = RunItem(id=candidate, kind=kind, spec=dict(spec), priority=priority,
-                        status=STATUS_QUEUED, paths=list(paths or []), gpu=gpu)
+                        status=STATUS_QUEUED, paths=list(paths or []), gpu=gpu,
+                        name=name, lineage=lineage, limits=limits, egress=egress)
         self._write(STATUS_QUEUED, item)
         return item
 
@@ -343,7 +461,9 @@ class RunStore:
         def _set_result(item: RunItem) -> None:
             item.result = result
 
-        return self._move(item_id, STATUS_RUNNING, status, mutate=_set_result)
+        done = self._move(item_id, STATUS_RUNNING, status, mutate=_set_result)
+        self._suspend_marker(item_id).unlink(missing_ok=True)
+        return done
 
     def requeue(self, item_id: str, not_before: float, *,
                 wait: Optional[dict[str, Any]] = None) -> Optional[RunItem]:
@@ -376,6 +496,103 @@ class RunStore:
             item.wait = wait
 
         return self._move(item_id, status, STATUS_QUEUED, mutate=_back)
+
+    # -- suspend / resume -------------------------------------------------
+
+    def _suspend_marker(self, item_id: str) -> Path:
+        self._validate_id(item_id)
+        return self.path / STATUS_RUNNING / f"{item_id}.suspend"
+
+    def suspend_requested(self, item_id: str) -> bool:
+        """Polled by whoever is RUNNING the item. Cheap: one stat."""
+        return self._suspend_marker(item_id).exists()
+
+    def suspend(self, item_id: str) -> RunItem:
+        """Park a run. Queued or claimed: moved to suspended/ now, by the same
+        rename a claim uses, so a suspend and a claim cannot both win. RUNNING:
+        the queue cannot stop someone else's process, so it leaves a request
+        beside the item and returns it still `running`; the runner sees the
+        request, stops, and calls park(). The request is a separate file, never
+        a rewrite of the item -- a rewrite racing finish() would resurrect a
+        finished run inside running/."""
+        for _ in range(3):
+            located = self._locate(item_id)
+            if located is None:
+                raise RunError(f"no such run: {item_id}")
+            status, _path = located
+            if status == STATUS_SUSPENDED:
+                item = self._read(status, item_id)
+                if item is not None:
+                    return item
+                continue
+            if status in CLOSED_STATUSES:
+                raise RunError(f"run {item_id} is already {status}, cannot suspend")
+            if status == STATUS_RUNNING:
+                marker = self._suspend_marker(item_id)
+                marker.write_text(str(time.time()), encoding="utf-8")
+                item = self._read(STATUS_RUNNING, item_id)
+                if item is not None:
+                    return item
+                marker.unlink(missing_ok=True)   # it finished under us
+                continue
+            moved = self._move(item_id, status, STATUS_SUSPENDED)
+            if moved is not None:
+                return moved
+        raise RunError(f"run {item_id} kept changing state; try again")
+
+    def park(self, item_id: str, checkpoint: Optional[dict[str, Any]] = None
+             ) -> Optional[RunItem]:
+        """The runner's half of suspending a RUNNING item: running -> suspended,
+        carrying whatever it needs to continue."""
+        def _checkpoint(item: RunItem) -> None:
+            item.checkpoint = checkpoint
+            item.claimed_by = None
+
+        parked = self._move(item_id, STATUS_RUNNING, STATUS_SUSPENDED, mutate=_checkpoint)
+        self._suspend_marker(item_id).unlink(missing_ok=True)
+        return parked
+
+    def resume(self, item_id: str) -> RunItem:
+        located = self._locate(item_id)
+        if located is None:
+            raise RunError(f"no such run: {item_id}")
+        status, _path = located
+        if status != STATUS_SUSPENDED:
+            raise RunError(f"run {item_id} is {status}, only a suspended run can be resumed")
+
+        def _back(item: RunItem) -> None:
+            item.not_before = 0.0
+            item.resumes = int(item.resumes or 0) + 1
+
+        item = self._move(item_id, STATUS_SUSPENDED, STATUS_QUEUED, mutate=_back)
+        if item is None:
+            raise RunError(f"run {item_id} was resumed or cancelled by someone else")
+        return item
+
+    def adopt(self, item: RunItem) -> RunItem:
+        """Take in a run suspended on ANOTHER queue, under its own id. It lands
+        suspended -- never queued -- so arriving is not the same as being run."""
+        self._validate_id(item.id)
+        if item.kind not in KINDS:
+            raise RunError(f"kind must be one of {KINDS}, got {item.kind!r}")
+        if self._locate(item.id) is not None:
+            raise RunError(f"run {item.id} already exists in this queue")
+        if item.name and self.find_by_name(item.name) is not None:
+            raise RunError(f"an open run is already named {item.name!r}")
+        item.status = STATUS_SUSPENDED
+        item.claimed_by = None
+        item.updated_at = time.time()
+        self._write(STATUS_SUSPENDED, item)
+        return item
+
+    def find_by_name(self, name: str) -> Optional[RunItem]:
+        """The OPEN run carrying this declared name, if any."""
+        if not name:
+            return None
+        for item in self.list(statuses=list(OPEN_STATUSES)):
+            if item.name == name:
+                return item
+        return None
 
     def cancel(self, item_id: str) -> Optional[RunItem]:
         located = self._locate(item_id)

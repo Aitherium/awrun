@@ -106,9 +106,11 @@ def _print_item(item: RunItem, *, as_json: bool) -> None:
         print(json.dumps(item.to_dict(), indent=2))
         return
     age = _fmt_age(time.time() - item.created_at)
-    label = item.spec.get("workflow") or item.spec.get("task") or item.kind
+    label = (item.name or item.spec.get("workflow") or item.spec.get("task")
+             or item.spec.get("entry") or item.spec.get("script") or item.kind)
+    why = " ".join(f"{k}={v}" for k, v in sorted((item.lineage or {}).items()))
     print(f"{item.id}  [{item.status:>9}]  p={item.priority:<3}  {item.kind:<5}  "
-          f"{age:>5} old  {label}")
+          f"{age:>5} old  {label}" + (f"  <- {why}" if why else ""))
 
 
 def _submit_comet_deploy_spec(args: argparse.Namespace) -> dict:
@@ -191,69 +193,344 @@ def _submit_tunnel_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
-def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
+def _build_spec(args: argparse.Namespace) -> dict:
+    """The run's spec from parsed arguments. PURE -- it authorizes nothing and
+    writes nothing, so `apply` can compare a manifest to the queue before it
+    decides there is anything to authorize. Raises RunError for a bad request."""
     spec: dict = {}
-    if args.kind == "ci":
+    kind = args.kind
+    if kind == "ci":
+        if not getattr(args, "workflow", None):
+            raise RunError("--workflow is required for --kind ci")
         spec["workflow"] = args.workflow
-        spec["ref"] = args.ref or "develop"
+        spec["ref"] = getattr(args, "ref", None) or "develop"
         inputs = {}
-        for kv in args.field or []:
+        for kv in getattr(args, "field", None) or []:
             if "=" not in kv:
-                print(f"ERROR: --field must be key=value, got {kv!r}", file=sys.stderr)
-                return 2
+                raise RunError(f"--field must be key=value, got {kv!r}")
             k, v = kv.split("=", 1)
             inputs[k] = v
         spec["inputs"] = inputs
-    elif args.kind == "comet-deploy":
-        try:
-            spec = _submit_comet_deploy_spec(args)
-        except RunError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 2
+    elif kind == "comet-deploy":
+        spec = _submit_comet_deploy_spec(args)
         if not spec.get("service_name"):
-            print("ERROR: --service-name is required for --kind comet-deploy "
-                  "(or set it in --spec-json)", file=sys.stderr)
-            return 2
-        denial = _authorize_comet_deploy(spec)
-        if denial is not None:
-            print(f"ERROR: {denial}", file=sys.stderr)
-            return 1
-    elif args.kind == "tunnel":
-        try:
-            spec = _submit_tunnel_spec(args)
-        except RunError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 2
-        denial = _authorize_gated("tunnel", spec)
-        if denial is not None:
-            print(f"ERROR: {denial}", file=sys.stderr)
-            return 1
-    elif args.kind in ("render", "artpack", "solve"):
-        print(f"ERROR: --kind {args.kind} is host-registered: its owner submits it with "
-              f"the spec that worker understands (RunStore.submit), not this CLI",
-              file=sys.stderr)
-        return 2
+            raise RunError("--service-name is required for --kind comet-deploy "
+                           "(or set it in --spec-json)")
+    elif kind == "tunnel":
+        spec = _submit_tunnel_spec(args)
+    elif kind in ("render", "artpack", "solve"):
+        raise RunError(f"--kind {kind} is host-registered: its owner submits it with "
+                       f"the spec that worker understands (RunStore.submit), not this CLI")
+    elif kind == "flow":
+        entry = getattr(args, "entry", None) or ""
+        script = getattr(args, "script", None) or ""
+        if bool(entry) == bool(script):
+            raise RunError("--kind flow needs exactly one of --entry module:function "
+                           "or --script path.py")
+        if entry:
+            spec["entry"] = entry
+        else:
+            spec["script"] = script
+            spec["function"] = getattr(args, "function", None) or "main"
+        if getattr(args, "budget_tokens", None):
+            spec["budget_tokens"] = int(args.budget_tokens)
     else:
-        if not args.task:
-            print("ERROR: --task is required for --kind agent", file=sys.stderr)
-            return 2
-        if not args.agent:
-            print("ERROR: --agent is required for --kind agent "
-                  "(see `adk agents ls` for valid names)", file=sys.stderr)
-            return 2
+        if not getattr(args, "task", None):
+            raise RunError("--task is required for --kind agent")
+        if not getattr(args, "agent", None):
+            raise RunError("--agent is required for --kind agent "
+                           "(see `adk agents ls` for valid names)")
         spec["task"] = args.task
         spec["agent"] = args.agent
-        if args.adk_args:
-            spec["adk_args"] = args.adk_args
+        if getattr(args, "adk_args", None):
+            spec["adk_args"] = list(args.adk_args)
+    image = getattr(args, "isolation_image", None)
+    if image:
+        spec["isolation"] = {"mode": "container", "image": image,
+                             "runtime": getattr(args, "isolation_runtime", None) or "podman"}
+    return spec
 
+
+def _authorize(kind: str, spec: dict) -> Optional[str]:
+    """None = allowed. Only kinds in `authz.KIND_PERMISSIONS` are gated; this is
+    the ONE place a write path asks, so `apply` cannot submit what `submit` refuses."""
+    from awrun import authz
+    if kind not in authz.KIND_PERMISSIONS:
+        return None
+    return _authorize_gated(kind, spec)
+
+
+def _constraints(args: argparse.Namespace) -> dict:
+    """name / lineage / limits / egress from flags. Raises RunError."""
+    lineage = {}
+    for kv in getattr(args, "lineage", None) or []:
+        if "=" not in kv:
+            raise RunError(f"--lineage must be key=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        lineage[k.strip()] = v.strip()
+    limits = {}
+    for flag, key in (("timeout_s", "timeout_s"), ("cpus", "cpus"), ("memory_mb", "memory_mb")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            limits[key] = value
+    egress = None
+    hosts = getattr(args, "egress_host", None) or []
+    if getattr(args, "no_egress", False) and hosts:
+        raise RunError("--no-egress and --egress-host contradict each other")
+    if getattr(args, "no_egress", False) or hosts:
+        egress = {"hosts": list(hosts)}
+        for flag, key in (("egress_proxy", "proxy"), ("egress_network", "network")):
+            if getattr(args, flag, None):
+                egress[key] = getattr(args, flag)
+    return {"name": getattr(args, "name", None) or "", "lineage": lineage or None,
+            "limits": limits or None, "egress": egress}
+
+
+def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
+    try:
+        spec = _build_spec(args)
+        extra = _constraints(args)
+    except RunError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    denial = _authorize(args.kind, spec)
+    if denial is not None:
+        print(f"ERROR: {denial}", file=sys.stderr)
+        return 1
     try:
         item = store.submit(args.kind, spec, priority=args.priority,
-                             paths=args.paths or [])
+                             paths=args.paths or [], **extra)
     except RunError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     _print_item(item, as_json=args.json)
     return 0
+
+
+def _guarded(action: str, run_id: str = "", **fields) -> bool:
+    """True = go ahead. Prints the refusal otherwise (exit 1 is the caller's)."""
+    from awrun import trail
+    denial = trail.guard(action, run_id, **fields)
+    if denial is not None:
+        print(f"ERROR: {denial}", file=sys.stderr)
+    return denial is None
+
+
+def cmd_export(args: argparse.Namespace, store: RunStore) -> int:
+    from awrun import handoff
+    if not _guarded("export", args.id):
+        return 1
+    try:
+        out = handoff.export_run(store, args.id, Path(args.out), sign=not args.no_seal)
+    except RunError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"exported {args.id} -> {out['bundle']}")
+    print(f"  sha256     {out['sha256']}")
+    print(f"  sealed by  {out['sealed_by'] or '(unsealed: import needs --sha256)'}")
+    print(f"  journal    {'included' if out['journal'] else 'none'}")
+    return 0
+
+
+def cmd_import(args: argparse.Namespace, store: RunStore) -> int:
+    from awrun import handoff
+    if not _guarded("import", bundle=str(args.bundle)):
+        return 1
+    try:
+        item = handoff.import_run(store, Path(args.bundle), expect_sha256=args.sha256 or "",
+                                  expect_key=args.expect_key or "")
+    except RunError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    _print_item(item, as_json=args.json)
+    return 0
+
+
+def cmd_suspend(args: argparse.Namespace, store: RunStore) -> int:
+    if not _guarded("suspend", args.id):
+        return 1
+    try:
+        item = store.suspend(args.id)
+    except RunError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    _print_item(item, as_json=args.json)
+    if item.status == "running" and not args.json:
+        print("  (running: asked its runner to stop; it parks at the next poll)")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace, store: RunStore) -> int:
+    if not _guarded("resume", args.id):
+        return 1
+    try:
+        item = store.resume(args.id)
+    except RunError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    _print_item(item, as_json=args.json)
+    return 0
+
+
+def cmd_egress_proxy(args: argparse.Namespace, store: RunStore) -> int:
+    from awrun import egress
+    host, _, port = args.listen.rpartition(":")
+    if not host or not port.isdigit():
+        print(f"ERROR: --listen must be host:port, got {args.listen!r}", file=sys.stderr)
+        return 2
+    return egress.serve(host, int(port), args.allow or [])
+
+
+# ── apply: a manifest is the desired queue, and applying it twice is a no-op ──
+
+API_VERSION = "awrun/v1"
+_RUN_KEYS = ("task", "agent", "adk_args", "workflow", "ref", "inputs", "service_name",
+             "target", "action", "hostname", "origin", "plane", "entry", "script",
+             "function", "budget_tokens")
+
+
+def _load_manifest(path: str) -> list:
+    text = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    if path.endswith(".json") or text.lstrip().startswith(("{", "[")):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RunError(f"{path}: not valid JSON: {exc}") from exc
+        return data if isinstance(data, list) else [data]
+    try:
+        import yaml
+    except ImportError:
+        raise RunError(f"{path} is YAML and PyYAML is not installed: "
+                       f"pip install 'awrun[yaml]', or write the manifest as JSON") from None
+    try:
+        return [doc for doc in yaml.safe_load_all(text) if doc is not None]
+    except yaml.YAMLError as exc:
+        raise RunError(f"{path}: not valid YAML: {exc}") from exc
+
+
+def _desired(doc: object, index: int) -> dict:
+    """One manifest document -> what the queue should hold. Raises RunError."""
+    where = f"document {index + 1}"
+    if not isinstance(doc, dict):
+        raise RunError(f"{where}: must be a mapping")
+    if doc.get("apiVersion") != API_VERSION or doc.get("kind") != "Run":
+        raise RunError(f"{where}: needs apiVersion: {API_VERSION} and kind: Run")
+    meta = doc.get("metadata") or {}
+    body = doc.get("spec") or {}
+    if not isinstance(meta, dict) or not isinstance(body, dict):
+        raise RunError(f"{where}: metadata and spec must be mappings")
+    name = meta.get("name") or ""
+    if not name:
+        raise RunError(f"{where}: metadata.name is required -- it is what apply converges on")
+    unknown = sorted(set(body) - {"kind", "priority", "paths", "limits", "egress", "gpu",
+                                  "isolation", "run"})
+    if unknown:
+        raise RunError(f"{where} ({name}): unknown spec keys {unknown}")
+    run = body.get("run") or {}
+    if not isinstance(run, dict):
+        raise RunError(f"{where} ({name}): spec.run must be a mapping")
+    stray = sorted(set(run) - set(_RUN_KEYS))
+    if stray:
+        raise RunError(f"{where} ({name}): unknown spec.run keys {stray}")
+    ns = argparse.Namespace(kind=body.get("kind"), spec_json=None, field=None,
+                            **{k: run.get(k) for k in _RUN_KEYS if k != "inputs"})
+    if ns.kind not in KINDS:
+        raise RunError(f"{where} ({name}): spec.kind must be one of {KINDS}")
+    if run.get("inputs"):
+        ns.field = [f"{k}={v}" for k, v in run["inputs"].items()]
+    spec = _build_spec(ns)
+    if body.get("isolation"):
+        spec["isolation"] = body["isolation"]
+    from awrun.store import (
+        validate_egress,
+        validate_gpu,
+        validate_limits,
+        validate_lineage,
+        validate_name,
+    )
+    priority = body.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise RunError(f"{where} ({name}): spec.priority must be an integer")
+    return {"name": validate_name(name), "kind": ns.kind, "spec": spec,
+            "priority": priority, "paths": list(body.get("paths") or []),
+            "lineage": validate_lineage(meta.get("lineage")),
+            "limits": validate_limits(body.get("limits")),
+            "egress": validate_egress(body.get("egress")),
+            "gpu": validate_gpu(ns.kind, body.get("gpu"))}
+
+
+_CONVERGED_FIELDS = ("kind", "spec", "paths", "lineage", "limits", "egress", "gpu")
+
+
+def apply_one(want: dict, store: RunStore, *, dry_run: bool = False) -> tuple[str, str]:
+    """(verdict, detail). Verdicts: created | unchanged | configured | replaced |
+    refused. An authorization denial is `refused` and nothing is written."""
+    have = store.find_by_name(want["name"])
+    if have is not None:
+        current = have.to_dict()
+        same = all((current.get(f) or None) == (want[f] or None) for f in _CONVERGED_FIELDS)
+        if same and have.priority == want["priority"]:
+            return "unchanged", have.id
+        if same:
+            if not dry_run:
+                from awrun import trail
+                denial = trail.guard("apply", have.id, name=want["name"],
+                                     priority=want["priority"])
+                if denial is not None:
+                    return "refused", denial
+                store.bump(have.id, want["priority"])
+            return "configured", f"{have.id} priority {have.priority} -> {want['priority']}"
+        if have.status in ("claimed", "running"):
+            return "refused", (f"{have.id} is {have.status} with a different spec; "
+                               f"suspend or cancel it first")
+    denial = _authorize(want["kind"], want["spec"])
+    if denial is not None:
+        return "refused", denial
+    if dry_run:
+        return ("replaced" if have is not None else "created"), "(dry run)"
+    from awrun import trail
+    denial = trail.guard("apply", have.id if have is not None else "", name=want["name"],
+                         kind=want["kind"], lineage=want["lineage"])
+    if denial is not None:
+        return "refused", denial
+    if have is not None:
+        store.cancel(have.id)
+    item = store.submit(want["kind"], want["spec"], priority=want["priority"],
+                        paths=want["paths"], gpu=want["gpu"], name=want["name"],
+                        lineage=want["lineage"], limits=want["limits"], egress=want["egress"])
+    return ("replaced" if have is not None else "created"), item.id
+
+
+def cmd_apply(args: argparse.Namespace, store: RunStore) -> int:
+    # Validate EVERY document before writing ANY: half a manifest applied is a
+    # state nobody wrote down.
+    try:
+        wanted = [_desired(doc, i) for i, doc in enumerate(_load_manifest(args.file))]
+    except (RunError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    names = [w["name"] for w in wanted]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        print(f"ERROR: manifest names {dupes} more than once", file=sys.stderr)
+        return 2
+    rows, refused = [], False
+    for want in wanted:
+        try:
+            verdict, detail = apply_one(want, store, dry_run=args.dry_run)
+        except RunError as exc:
+            verdict, detail = "refused", str(exc)
+        refused = refused or verdict == "refused"
+        rows.append({"name": want["name"], "verdict": verdict, "detail": detail})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print(f"run/{row['name']} {row['verdict']}  {row['detail']}")
+    return 1 if refused else 0
 
 
 def cmd_bump(args: argparse.Namespace, store: RunStore) -> int:
@@ -272,6 +549,9 @@ def cmd_queue(args: argparse.Namespace, store: RunStore) -> int:
         from awrun.store import OPEN_STATUSES
         statuses = list(OPEN_STATUSES)
     items = store.list(statuses=statuses, kind=args.kind)
+    for kv in getattr(args, "lineage", None) or []:
+        key, _, value = kv.partition("=")
+        items = [i for i in items if (i.lineage or {}).get(key.strip()) == value.strip()]
     if args.json:
         print(json.dumps([i.to_dict() for i in items], indent=2))
         return 0
@@ -293,6 +573,8 @@ def cmd_status(args: argparse.Namespace, store: RunStore) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace, store: RunStore) -> int:
+    if not _guarded("cancel", args.id):
+        return 1
     try:
         item = store.cancel(args.id)
     except RunError as exc:
@@ -351,15 +633,19 @@ def _self_test() -> int:
                    ("AITHER_SESSION_BEARER", "AWRUN_COMET_DEPLOY_OPERATORS",
                     "AWRUN_TUNNEL_OPERATORS", "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
         try:
-            rc = cmd_submit(no_token_args, store)
-            check("comet-deploy submit with NO session token is refused (exit 1)", rc == 1)
-            check("...and nothing was queued as a result",
-                  len(store.list(statuses=["queued"], kind="comet-deploy")) == 0)
-
+            # Pointed at the scratch dir BEFORE the first submit: the denial below
+            # is audited, and a self-test must not write the operator's real trail.
             iam_path = Path(td) / "iam.json"
             audit_path = Path(td) / "audit.log"
             os.environ["AWRUN_IAM_DIRECTORY"] = str(iam_path)
             os.environ["AWRUN_AUDIT_LOG"] = str(audit_path)
+
+            rc = cmd_submit(no_token_args, store)
+            check("comet-deploy submit with NO session token is refused (exit 1)", rc == 1)
+            check("...and nothing was queued as a result",
+                  len(store.list(statuses=["queued"], kind="comet-deploy")) == 0)
+            check("...and the no-token denial went to the SCRATCH trail",
+                  audit_path.exists() and "comet-deploy-denied" in audit_path.read_text())
 
             from awiam import Directory, Sessions, Subject
             directory = Directory(str(iam_path))
@@ -441,6 +727,15 @@ def _self_test() -> int:
     from . import surface as _sf
     if _sf.self_test() != 0:
         ok = False
+    from . import confine as _cf
+    if _cf.self_test() != 0:
+        ok = False
+    from . import egress as _eg
+    if _eg.self_test() != 0:
+        ok = False
+    from . import trail as _tr
+    if _tr.self_test() != 0:
+        ok = False
 
     print("SELF-TEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -492,6 +787,64 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--plane", choices=list(_TUNNEL_PLANES), default="tunnel",
                          help="[kind=tunnel] which plane serves the hostname")
 
+    submit.add_argument("--entry", help="[kind=flow] module:function of the workflow")
+    submit.add_argument("--script", help="[kind=flow] path to a workflow script")
+    submit.add_argument("--function", help="[kind=flow] function in --script (default: main)")
+    submit.add_argument("--budget-tokens", dest="budget_tokens", type=int,
+                         help="[kind=flow] token budget for the whole workflow")
+    submit.add_argument("--name", help="declared name; `apply` converges on it")
+    submit.add_argument("--lineage", action="append",
+                         help="why this run exists, key=value, repeatable "
+                              "(intent, goal, expedition, flow, plan, notebook, parent_run)")
+    submit.add_argument("--timeout-s", dest="timeout_s", type=int)
+    submit.add_argument("--cpus", type=float)
+    submit.add_argument("--memory-mb", dest="memory_mb", type=int)
+    submit.add_argument("--egress-host", dest="egress_host", action="append",
+                         help="allow outbound traffic to this host[:port] ONLY; repeatable")
+    submit.add_argument("--no-egress", dest="no_egress", action="store_true",
+                         help="no outbound traffic at all")
+    submit.add_argument("--egress-proxy", dest="egress_proxy",
+                         help="URL of an `awrun egress-proxy` the run must leave through")
+    submit.add_argument("--egress-network", dest="egress_network",
+                         help="INTERNAL container network the run is placed on")
+    submit.add_argument("--isolation-image", dest="isolation_image",
+                         help="run inside this container image (needed for cpus, "
+                              "memory and egress to be enforceable)")
+    submit.add_argument("--isolation-runtime", dest="isolation_runtime",
+                         choices=["podman", "docker"])
+
+    suspend = sub.add_parser("suspend", parents=[json_flag],
+                              help="park a run: it keeps its id, priority, age and checkpoint")
+    suspend.add_argument("id")
+    resume = sub.add_parser("resume", parents=[json_flag],
+                             help="put a suspended run back in the queue")
+    resume.add_argument("id")
+
+    apply = sub.add_parser("apply", parents=[json_flag],
+                            help="converge the queue on a manifest (idempotent by name)")
+    apply.add_argument("-f", "--file", required=True, help="manifest path, or - for stdin")
+    apply.add_argument("--dry-run", dest="dry_run", action="store_true")
+
+    export = sub.add_parser("export", parents=[json_flag],
+                             help="bundle a SUSPENDED run (and its journal) to move it "
+                                  "to another machine; closes the local copy")
+    export.add_argument("id")
+    export.add_argument("--out", default=".", help="directory for the bundle")
+    export.add_argument("--no-seal", dest="no_seal", action="store_true",
+                         help="do not sign the bundle even if a signing key exists")
+    imp = sub.add_parser("import", parents=[json_flag],
+                          help="take in an exported run; it lands suspended")
+    imp.add_argument("bundle")
+    imp.add_argument("--sha256", help="the digest the exporter printed")
+    imp.add_argument("--expect-key", dest="expect_key",
+                      help="the exporter's public signing key (hex)")
+
+    proxy = sub.add_parser("egress-proxy",
+                            help="allowlisting forward proxy: the only door out of a "
+                                 "confined run")
+    proxy.add_argument("--listen", default="127.0.0.1:3128")
+    proxy.add_argument("--allow", action="append", help="host[:port] or *.suffix; repeatable")
+
     bump = sub.add_parser("bump", help="change a queued/claimed run's priority",
                            parents=[json_flag])
     bump.add_argument("id")
@@ -501,6 +854,8 @@ def build_parser() -> argparse.ArgumentParser:
                             parents=[json_flag])
     queue.add_argument("--all", action="store_true", help="include done/failed/cancelled")
     queue.add_argument("--kind", choices=list(KINDS))
+    queue.add_argument("--lineage", action="append",
+                        help="only runs whose lineage has key=value, repeatable")
 
     status = sub.add_parser("status", help="one run in full", parents=[json_flag])
     status.add_argument("id")
@@ -792,7 +1147,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "self-test":
-        return _self_test()
+        from awrun import trail
+        with trail.scratch_log():
+            return _self_test()
     if args.command is None:
         parser.print_help()
         return 2
@@ -804,6 +1161,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "queue": cmd_queue,
         "status": cmd_status,
         "cancel": cmd_cancel,
+        "suspend": cmd_suspend,
+        "resume": cmd_resume,
+        "apply": cmd_apply,
+        "export": cmd_export,
+        "import": cmd_import,
+        "egress-proxy": cmd_egress_proxy,
         "groups": cmd_groups,
         "capacity": cmd_capacity,
         "surface": cmd_surface,

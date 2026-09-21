@@ -24,7 +24,7 @@ import sys
 #: would go stale in silence. Regenerate to update.
 SELF = 'awrun'
 FAMILY = ['awask', 'awavatar', 'awbac', 'awbrain', 'awbrowse', 'awclassify', 'awdecide', 'awdeck', 'awdelphi', 'awdit', 'awembed', 'awevolve', 'awfind', 'awflow', 'awfocus', 'awgit', 'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awmine', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpool', 'awpredict', 'awprism', 'awprove', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrena', 'awrepl', 'awreport', 'awresearch', 'awrise', 'awrouter', 'awrtifact', 'awscreen', 'awseal', 'awsettings', 'awshare', 'awsprite', 'awstorage', 'awswarm', 'awtax', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall', 'gawbbonet']
-PAIRS_WITH = ['adk', 'awevolve', 'awpool', 'awrelay', 'awrise']
+PAIRS_WITH = ['awbac', 'awdit', 'adk', 'awevolve', 'awflow', 'awiam', 'awpool', 'awrelay', 'awrise', 'awseal', 'awshare']
 
 #: This brick's OWN config, read out of its source at generation time.
 #: ENV_REQUIRED is `os.environ["X"]` -- absent, that is a KeyError the moment
@@ -33,7 +33,7 @@ PAIRS_WITH = ['adk', 'awevolve', 'awpool', 'awrelay', 'awrise']
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
 ENV_REQUIRED = ['AWRUN_AUDIT_LOG', 'AWRUN_COMET_DEPLOY_OPERATORS', 'AWRUN_IAM_DIRECTORY', 'AWRUN_TUNNEL_OPERATORS']
-ENV_OPTIONAL = ['AWRUN_CA_BUNDLE']
+ENV_OPTIONAL = ['AWRUN_CA_BUNDLE', 'AWRUN_FLOW_FAKE_DISPATCHER']
 
 
 def _installed(mod: str) -> "str | None":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awrun"
-version = "0.1.3"
+version = "0.2.0"
 description = "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds — real dynamic priority for the class of work we control, instead of GitHub Actions' opaque FIFO."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,13 @@ dependencies = ["awbac>=0.1.0", "awdit>=0.1.0"]
 # the CLI being on PATH. Declared here anyway so a missing `gh` fails with a
 # clear message at submit time rather than a bare FileNotFoundError.
 ci = []
+# `awrun apply -f manifest.yaml`. JSON manifests need nothing.
+yaml = ["pyyaml>=6.0"]
+# `--kind flow`: journaled workflows that resume by replay.
+flow = ["aitherium-awflow>=0.2.1"]
+# Identity, policy, audit trail and sealed handoff. All optional: without them a
+# single-user queue still works, and a gated action is refused rather than allowed.
+governed = ["awiam", "awbac", "awdit", "awseal", "awshare"]
 
 dev = ["pytest>=7.0"]
 

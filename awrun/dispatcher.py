@@ -7,7 +7,7 @@ task (matching `AitherOS/config/routines/*.yaml`'s existing pattern) or a
 one-shot `--once` invocation. One fewer always-on service is one fewer thing
 that can silently die without anyone noticing.
 
-Seven kinds, seven handlers, one dispatch loop:
+Eight kinds, eight handlers, one dispatch loop:
 
 * `agent`        — Phase 1 (done). `adk chat <agent> "<task>"`.
 * `ci`            — Phase 2 (done). `gh workflow run <workflow> --ref <ref> -f k=v...`.
@@ -23,6 +23,16 @@ Seven kinds, seven handlers, one dispatch loop:
   (required for expose, forbidden for retire), "plane": "tunnel"|"pages"|"worker"}`.
   Submit is authz-gated (`awrun:submit:tunnel`) like comet-deploy: a public
   hostname is perimeter. The executor is the tunnel plane's one writer, not awrun.
+* `flow`          -- a journaled workflow in a child process. The run id is the
+  journal id, so a flow that was suspended (or killed) continues from its journal:
+  the calls it already made are replayed, not made again.
+
+Suspend (2026-09-21): a runner that is asked to stop raises `Suspended`; the item
+goes running -> suspended with its checkpoint, its GPU lease is released, and
+`awrun resume` puts it back in the queue with its id, priority and age intact.
+
+Confinement: a run that declares limits or an egress allowlist its runner cannot
+enforce is FAILED before it starts (`awrun.confine`), never run unconfined.
 
 Dispatch itself is priority-first across ALL kinds, not per-kind: the whole
 point of this package was one queue an urgent item can jump, and a dispatcher
@@ -56,6 +66,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+from awrun import confine, trail
 from awrun.store import GPU_KINDS, RunItem, RunStore, get_store
 
 logger = logging.getLogger(__name__)
@@ -63,6 +74,62 @@ logger = logging.getLogger(__name__)
 #: Injectable so tests never spawn a real process or make a real HTTP call.
 #: Returns (returncode, message) — message is stored in the run's `result`.
 RunFn = Callable[[RunItem], "tuple[int, str]"]
+
+
+class Suspended(Exception):  # noqa: N818 - a state, not an error
+    """Raised by a run handler that stopped because it was asked to. `checkpoint`
+    is whatever that handler needs to continue; the queue stores it untouched."""
+
+    def __init__(self, checkpoint: Optional[dict] = None, message: str = "") -> None:
+        super().__init__(message or "suspended on request")
+        self.checkpoint = checkpoint
+
+
+_POLL_S = 0.5
+_TERM_GRACE_S = 10.0
+
+
+def _run_child(item: RunItem, argv: list[str], *, default_timeout: float,
+               checkpoint: Optional[dict] = None, env: Optional[dict] = None
+               ) -> tuple[int, str]:
+    """Run one child process to completion -- or stop it when the queue asks.
+
+    The child's output goes to a file, not a pipe: a pipe nobody drains blocks
+    the child at 64 KB, and this loop is polling, not reading."""
+    import tempfile
+
+    store_path = (item.spec.get("_awrun") or {}).get("store")
+    store = RunStore(store_path) if store_path else None
+    deadline = time.time() + confine.timeout_for(item, default_timeout)
+    with tempfile.TemporaryFile() as sink:
+        try:
+            proc = subprocess.Popen(confine.wrap_argv(item, argv), stdout=sink,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env=env)
+        except OSError as exc:
+            return 1, f"could not start {argv[0]}: {exc}"
+        stopped = ""
+        while proc.poll() is None:
+            if store is not None and store.suspend_requested(item.id):
+                stopped = "suspend"
+            elif time.time() > deadline:
+                stopped = "timeout"
+            if stopped:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=_TERM_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                break
+            time.sleep(_POLL_S)
+        sink.seek(0)
+        out = sink.read().decode("utf-8", errors="replace")[-4000:]
+    if stopped == "suspend":
+        raise Suspended(checkpoint, out)
+    if stopped == "timeout":
+        return 1, f"timed out after {confine.timeout_for(item, default_timeout):.0f}s\n{out}"
+    return proc.returncode, out
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -89,13 +156,67 @@ def _real_run_agent(item: RunItem) -> tuple[int, str]:
     argv = _build_agent_argv(item)
     if argv is None:
         return 1, "spec.agent is required (see `adk agents ls` for valid names)"
+    # tail only -- a run's full log is not the queue's job
+    return _run_child(item, argv, default_timeout=3600)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# kind=flow
+# ─────────────────────────────────────────────────────────────────────────
+
+def _flow_journal_dir(item: RunItem) -> str:
+    explicit = item.spec.get("journal")
+    if explicit:
+        return str(explicit)
+    store_path = (item.spec.get("_awrun") or {}).get("store")
+    root = Path(store_path) if store_path else Path.home() / ".aither" / "awrun"
+    return str(root / "journals")
+
+
+def _build_flow_argv(item: RunItem) -> Optional[list[str]]:
+    """Pure, same reason as _build_agent_argv. The run id is the journal id on
+    EVERY start, which is the whole of how a resumed flow finds its past."""
+    entry = item.spec.get("entry", "")
+    script = item.spec.get("script", "")
+    if not entry and not script:
+        return None
+    argv = [sys.executable, "-m", "awrun._flow_runner", "--run-id", item.id,
+            "--journal", _flow_journal_dir(item)]
+    argv += ["--entry", entry] if entry else ["--script", script,
+                                              "--function", item.spec.get("function", "main")]
+    if item.spec.get("budget_tokens"):
+        argv += ["--budget", str(int(item.spec["budget_tokens"]))]
+    return argv
+
+
+def _real_run_flow(item: RunItem) -> tuple[int, str]:
+    argv = _build_flow_argv(item)
+    if argv is None:
+        return 1, "spec.entry (module:function) or spec.script is required"
+    env = dict(os.environ)
+    for key, value in (item.lineage or {}).items():
+        env[f"AWRUN_LINEAGE_{key.upper()}"] = value
+    env["AWRUN_RUN_ID"] = item.id
+    journal = Path(_flow_journal_dir(item)) / item.id / "journal.jsonl"
+    # Replay trusts the journal: whatever it says happened is handed back as this
+    # run's own past. So a journal that changed while the run was parked is not
+    # replayed -- the digest taken at suspend has to still match.
+    sealed = (item.checkpoint or {}).get("journal_sha256")
+    if sealed:
+        from awrun.handoff import sha256_file
+        actual = sha256_file(journal) if journal.is_file() else "(missing)"
+        if actual != sealed:
+            return 1, (f"journal changed while suspended (expected {sealed[:12]}…, "
+                       f"found {actual[:12]}…); refusing to replay it")
     try:
-        proc = subprocess.run(argv, capture_output=True, timeout=3600, check=False,
-                               encoding="utf-8", errors="replace")
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 1, f"could not run adk: {exc}"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, out[-4000:]  # tail only — a run's full log is not the queue's job
+        return _run_child(item, argv, default_timeout=6 * 3600, env=env)
+    except Suspended as parked:
+        from awrun.handoff import sha256_file
+        parked.checkpoint = {"kind": "flow-journal", "run_id": item.id,
+                             "journal": _flow_journal_dir(item)}
+        if journal.is_file():
+            parked.checkpoint["journal_sha256"] = sha256_file(journal)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -512,6 +633,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "artpack": _real_run_artpack,
     "solve": _real_run_solve,
     "tunnel": _real_run_tunnel,
+    "flow": _real_run_flow,
 }
 
 
@@ -552,6 +674,11 @@ def dispatch_once(store: RunStore, *, worker_id: str,
 
     run_fn = fns.get(claimed.kind)
     runnable = run_fn is not None and not getattr(run_fn, "awrun_not_implemented", False)
+
+    # Asked BEFORE any lease: a run that will be refused must not evict real work.
+    gap = confine.enforcement_gap(claimed, run_fn) if runnable else None
+    if gap is not None:
+        runnable = False
 
     # ── GPU lease: asked BEFORE start, so a refusal is claimed -> queued ────
     # Only when there is something to run: a lease taken for a handler that
@@ -606,6 +733,7 @@ def dispatch_once(store: RunStore, *, worker_id: str,
                            "granted_mb": getattr(lease, "granted_mb", 0)}
 
     beat: Optional[_Heartbeat] = None
+    suspended_checkpoint: dict = {}
     outcome = "failed"
     code, message = 1, "the run did not complete"
     try:
@@ -619,7 +747,13 @@ def dispatch_once(store: RunStore, *, worker_id: str,
 
         if run_fn is None:
             code, message = 1, f"no run handler registered for kind={running.kind!r}"
+        elif gap is not None:
+            logger.error("awrun: %s [%s] NOT RUN: %s", running.id, running.kind, gap)
+            code, message = 1, gap
         else:
+            # In memory only, like _gpu_lease below: lets a handler poll THIS store
+            # for a suspend request without the queue persisting a local path.
+            running.spec["_awrun"] = {"store": str(store.path)}
             if lease is not None:
                 beat = _Heartbeat(client, lease)
                 beat.start()
@@ -631,11 +765,16 @@ def dispatch_once(store: RunStore, *, worker_id: str,
                     "granted_mb": getattr(lease, "granted_mb", 0)}
             try:
                 code, message = run_fn(running)
+            except Suspended as parked:
+                outcome = "suspended"
+                suspended_checkpoint = parked.checkpoint or {}
+                code, message = 0, str(parked)[-4000:]
             except Exception as exc:  # noqa: BLE001 - a raising handler is a FAILED run,
                 # not an item stranded in running/ forever with its lease held.
                 logger.exception("awrun: run handler for %s raised", running.id)
                 code, message = 1, f"run handler raised {type(exc).__name__}: {exc}"[:4000]
-        outcome = "done" if code == 0 else "failed"
+        if outcome != "suspended":
+            outcome = "done" if code == 0 else "failed"
     finally:
         if beat is not None:
             beat.stop()
@@ -652,12 +791,23 @@ def dispatch_once(store: RunStore, *, worker_id: str,
             if lease_state is not None:
                 lease_state["released"] = released
 
+    if outcome == "suspended":
+        # The lease is already released above: a parked run holds no GPU.
+        parked_item = store.park(running.id, suspended_checkpoint)
+        if parked_item is not None:
+            trail.note("parked", parked_item.id, kind=parked_item.kind, worker=worker_id,
+                       lineage=parked_item.lineage)
+            _broadcast(parked_item, "suspended", client=relay_client)
+        return parked_item
+
     status = "done" if code == 0 else "failed"
     result = {"code": code, "message": message}
     if lease_state is not None:
         result["gpu_lease"] = lease_state
     finished = store.finish(running.id, status=status, result=result)
     if finished is not None:
+        trail.note(status if gap is None else "refused-unconfined", finished.id,
+                   kind=finished.kind, worker=worker_id, lineage=finished.lineage, code=code)
         _broadcast(finished, status, client=relay_client)
     return finished
 
@@ -969,7 +1119,8 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.self_test:
-        return _self_test()
+        with trail.scratch_log():
+            return _self_test()
 
     store = get_store()
     if args.once:
