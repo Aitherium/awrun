@@ -685,7 +685,7 @@ def _self_test() -> int:
                 tunnel_args = argparse.Namespace(
                     kind="tunnel", priority=0, paths=[], json=False,
                     action="expose", hostname="demo.example.com",
-                    origin="http://aitheros-veil:3000", plane="tunnel",
+                    origin="http://app-web:3000", plane="tunnel",
                 )
                 os.environ.pop("AWRUN_TUNNEL_OPERATORS", None)
                 rc5 = cmd_submit(tunnel_args, store)
@@ -697,7 +697,7 @@ def _self_test() -> int:
                 check("a tunnel operator's expose reaches the queue with the decided spec shape",
                       rc6 == 0 and len(queued_t) == 1 and queued_t[0].spec == {
                           "action": "expose", "hostname": "demo.example.com",
-                          "origin": "http://aitheros-veil:3000", "plane": "tunnel"})
+                          "origin": "http://app-web:3000", "plane": "tunnel"})
             bad = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                      action="retire", hostname="demo.example.com",
                                      origin="http://x:1", plane="tunnel")
@@ -707,7 +707,7 @@ def _self_test() -> int:
                   and len(store.list(statuses=["queued"], kind="tunnel")) == tunnels_before)
             bad2 = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                       action="expose", hostname="demo.example.com",
-                                      origin="aitheros-veil:3000", plane="tunnel")
+                                      origin="app-web:3000", plane="tunnel")
             check("expose without a scheme on the origin is refused (exit 2)",
                   cmd_submit(bad2, store) == 2)
         finally:
