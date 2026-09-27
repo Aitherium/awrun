@@ -15,3 +15,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def _scratch_audit_log(tmp_path, monkeypatch):
     monkeypatch.setenv("AWRUN_AUDIT_LOG", str(tmp_path / "awrun-audit.log"))
+
+
+@pytest.fixture(autouse=True)
+def _host_admission_off(monkeypatch):
+    """Dispatch tests assert queue behaviour, not the load of the machine running
+    them; test_host_admission.py turns the check back on where it is the subject."""
+    monkeypatch.setenv("AWRUN_HOST_ADMISSION", "off")

@@ -66,7 +66,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-from awrun import confine, trail
+from awrun import confine, host_admission, trail
 from awrun.store import GPU_KINDS, RunItem, RunStore, get_store
 
 logger = logging.getLogger(__name__)
@@ -679,6 +679,23 @@ def dispatch_once(store: RunStore, *, worker_id: str,
     gap = confine.enforcement_gap(claimed, run_fn) if runnable else None
     if gap is not None:
         runnable = False
+
+    # ── Host admission: a heavy item never starts on a starving host ────────
+    # Asked before the GPU lease so a deferral holds no card. "Not now" is a
+    # requeue with backoff, exactly like a lease refusal -- never `failed`.
+    if runnable:
+        admitted, why, host_now = host_admission.admit(claimed.kind)
+        if not admitted:
+            delay = _lease_backoff_s(claimed.requeues, None)
+            back = store.requeue(claimed.id, now_fn() + delay,
+                                 wait={"reason": f"host over budget: {why}",
+                                       "host": host_now})
+            logger.warning("awrun: %s [%s] host over budget (%s) -- requeued, retry in %.0fs",
+                           claimed.id, claimed.kind, why, delay)
+            if back is not None:
+                _broadcast(back, f"requeued: host over budget ({why}), retry in {delay:.0f}s",
+                           client=relay_client)
+            return back
 
     # ── GPU lease: asked BEFORE start, so a refusal is claimed -> queued ────
     # Only when there is something to run: a lease taken for a handler that
