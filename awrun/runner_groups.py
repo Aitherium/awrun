@@ -50,23 +50,17 @@ class RunnerGroupError(RuntimeError):
 
 
 def _vault_token() -> str:
-    """Inside the AitherOS fleet the token lives in the vault, not the environment
-    (the worker's env copy of GITHUB_TOKEN answers 401; the vault's answers 200 --
-    measured 2026-09-10 and again 2026-09-21, when the 5-minute autoscaler turned
-    out to have never run once). A stranger's machine has no such client; then
-    this is simply not a path and the env rule below stands."""
-    try:
-        from lib.clients.aither_secrets import get_secret  # in-fleet only
-    except Exception:  # noqa: BLE001 - no fleet client here
-        return ""
-    for name in ("GH_ORG_ADMIN_TOKEN", "GITHUB_TOKEN"):
-        try:
-            v = (get_secret(name) or "").strip()
-        except Exception:  # noqa: BLE001 - try the next name
-            continue
-        if v:
-            return v
-    return ""
+    """A token from the HOST's credential store, via the plugin seam.
+
+    Inside a larger system the token may live in a vault rather than the
+    environment (an env copy can be stale and answer 401 while the vault's
+    answers 200). awrun ships standalone and knows no vault: the host registers
+    ``plugins.GITHUB_TOKEN_SOURCE``. Nothing registered, or a hook that fails
+    or returns nothing, means "not a path here" and the env rule stands."""
+    from . import plugins
+
+    v = plugins.call(plugins.GITHUB_TOKEN_SOURCE)
+    return v.strip() if isinstance(v, str) else ""
 
 
 def _token() -> str:

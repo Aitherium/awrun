@@ -40,6 +40,12 @@ REAP_CAPACITY = "reap_capacity"
 #: environment and reports "no door" when there is none.
 GPU_LEASE_CLIENT = "gpu_lease_client"
 
+#: () -> str. A GitHub token from wherever the HOST keeps credentials (a vault,
+#: a keyring). Consulted only after GH_TOKEN / GITHUB_TOKEN / AWRUN_GH_TOKEN are
+#: all unset; an empty string or a failure means "none here" and the next
+#: fallback is tried. awrun itself knows no vault.
+GITHUB_TOKEN_SOURCE = "github_token_source"
+
 #: Why the host provisioner failed to import, when it did. None means it was
 #: never attempted or it succeeded. Recorded rather than swallowed: a silent
 #: ImportError leaves `awrun capacity --add` exiting 0 having done nothing,

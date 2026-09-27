@@ -42,6 +42,44 @@ def _add_monorepo_root_to_syspath() -> None:
         _sys.path.insert(0, str(root))
 
 
+def _load_host_plugin():
+    """Load the host capacity plugin from a FILE path and return the module.
+
+    The path is ``$AWRUN_CAPACITY_PLUGIN`` when set, else the marker file found
+    by :func:`_monorepo_root`. Raises ImportError when there is neither, or the
+    file fails to load -- the caller records why.
+    """
+    import importlib.util
+
+    override = os.environ.get("AWRUN_CAPACITY_PLUGIN", "").strip()
+    if override:
+        path = Path(override)
+    else:
+        root = _monorepo_root()
+        if root is None:
+            raise ImportError("no host capacity plugin: AWRUN_CAPACITY_PLUGIN is "
+                              "unset and no checkout marker was found")
+        path = root.joinpath(*_MONOREPO_MARKER)
+    if not path.is_file():
+        raise ImportError(f"host capacity plugin not found: {path}")
+    name = "_awrun_host_capacity_plugin"
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load host capacity plugin: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - surfaced as ImportError, with cause
+        sys.modules.pop(name, None)
+        raise ImportError(f"host capacity plugin failed to load ({path}): "
+                          f"{type(exc).__name__}: {exc}") from exc
+    return module
+
+
 def _register_capacity_provider() -> None:
     """Register the host's capacity provisioner with awrun.plugins if available.
 
@@ -71,19 +109,19 @@ def _register_capacity_provider() -> None:
     _add_monorepo_root_to_syspath()
 
     try:
-        # Try to import from the monorepo dev tools
-        # This succeeds only on the host; it fails gracefully on PyPI/strangers
-        from AitherOS.dev.tools.awrun_capacity import (
-            provision_capacity,
-            reap_capacity,
-        )
-        plugins.register(plugins.PROVISION_CAPACITY, provision_capacity)
+        # The provider is a host FILE, loaded by path -- never a package import,
+        # so the published awrun names no module it does not ship.
+        # AWRUN_CAPACITY_PLUGIN overrides the discovered path.
+        host = _load_host_plugin()
+        plugins.register(plugins.PROVISION_CAPACITY, host.provision_capacity)
         # Registered in the SAME place as the provisioner on purpose: an
         # autoscaler that can grow and cannot shrink is a spend generator, and
         # wiring the two halves apart is how one of them stays unwired.
-        plugins.register(getattr(plugins, "REAP_CAPACITY", "reap_capacity"),
-                         reap_capacity)
-    except (ImportError, ModuleNotFoundError) as exc:
+        plugins.register(plugins.REAP_CAPACITY, host.reap_capacity)
+        token_source = getattr(host, "github_token_source", None)
+        if callable(token_source) and plugins.get(plugins.GITHUB_TOKEN_SOURCE) is None:
+            plugins.register(plugins.GITHUB_TOKEN_SOURCE, token_source)
+    except (ImportError, AttributeError) as exc:
         # Absent is FINE for a stranger: awrun ships to PyPI and still measures
         # saturation without a provisioner. But on a host that plainly HAS the
         # monorepo, a swallowed ImportError is how a provisioner stays dead for
