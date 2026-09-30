@@ -32,8 +32,8 @@ PAIRS_WITH = ['awbac', 'awdit', 'adk', 'awevolve', 'awflow', 'awiam', 'awpool', 
 #: the caller cope. Only this brick's namespace is listed: reporting the
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
-ENV_REQUIRED = ['AWRUN_AUDIT_LOG', 'AWRUN_COMET_DEPLOY_OPERATORS', 'AWRUN_IAM_DIRECTORY', 'AWRUN_TUNNEL_OPERATORS']
-ENV_OPTIONAL = ['AWRUN_CA_BUNDLE', 'AWRUN_FLOW_FAKE_DISPATCHER']
+ENV_REQUIRED = []
+ENV_OPTIONAL = ['AWRUN_AUDIT_LOG', 'AWRUN_CAPACITY_PLUGIN', 'AWRUN_CA_BUNDLE', 'AWRUN_COMET_DEPLOY_OPERATORS', 'AWRUN_FLOW_FAKE_DISPATCHER', 'AWRUN_HOST_ADMISSION', 'AWRUN_HOST_BUDGET', 'AWRUN_IAM_DIRECTORY']
 
 
 def _installed(mod: str) -> "str | None":
