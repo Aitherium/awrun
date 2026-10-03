@@ -135,6 +135,13 @@ def acquire(cls: str, vram_mb: int, *, backend: str = "", host_pref: str = "auto
             "host_pref": host_pref, "ttl_s": int(ttl_s), "job_ref": job_ref,
             "wait_s": float(wait_s), "consumer_id": consumer_id}
     errors: list[str] = []
+    auth_rejected: list[str] = []
+    # A 401/403 is the door ANSWERING: it will not lease to this caller. Folding it
+    # into LeaseUnavailable sent it down the arbiter-is-down path, where awrun's
+    # dispatcher runs the GPU job UNLEASED (measured 2026-10-03: the host door
+    # answered 401 'Missing internal authentication' and both clients called it
+    # unreachable). Another door may still accept us, so keep trying; refuse only
+    # when none granted.
     for base in (door_bases if door_bases is not None else bases()):
         try:
             status, payload = send(f"{base}/acquire", body, wait_s + 120)
@@ -153,7 +160,14 @@ def acquire(cls: str, vram_mb: int, *, backend: str = "", host_pref: str = "auto
                          expires_at=float(payload.get("expires_at") or 0),
                          actions_taken=list(payload.get("actions_taken") or []),
                          door=base)
+        if status in (401, 403):
+            auth_rejected.append(f"{base}: HTTP {status} {str(payload)[:160]}")
+            continue
         errors.append(f"{base}: HTTP {status} {str(payload)[:160]}")
+    if auth_rejected:
+        raise LeaseRefused({"reason": "the door rejected this caller's credentials: "
+                                      + "; ".join(auth_rejected + errors),
+                            "lanes": {"wait": {"eta_s": 300}}})
     raise LeaseUnavailable(
         "no GPU lease door answered: "
         + ("; ".join(errors) or f"{_BASE_ENV} is not set, so there is no door to ask"))

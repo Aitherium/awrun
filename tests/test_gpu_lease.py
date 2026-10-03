@@ -135,3 +135,35 @@ def test_http_client_failures_are_unavailable_not_raw():
     lease = Lease(token="tok", door="http://door-a")
     assert heartbeat(lease, post=post) is False
     assert release(lease, "done", post=post) is False
+
+
+def test_401_is_a_refusal_not_an_unavailability():
+    """A door that rejects our credentials ANSWERED. As LeaseUnavailable it took the
+    arbiter-is-down path, where the dispatcher runs the GPU job unleased."""
+    def post(url, body, timeout):
+        return 401, {"detail": "Missing internal authentication"}
+
+    with pytest.raises(LeaseRefused) as info:
+        acquire("arc", 8000, door_bases=BASES, post=post)
+    assert "credentials" in info.value.reason and "401" in info.value.reason
+    assert info.value.busy_retry_ms == 300000
+
+
+def test_403_on_one_door_still_lets_the_next_door_grant():
+    def post(url, body, timeout):
+        if url.startswith("http://door-a"):
+            return 403, {"detail": "forbidden"}
+        return 200, {"token": "t3"}
+
+    lease = acquire("arc", 8000, door_bases=BASES, post=post)
+    assert lease.door == "http://door-b" and lease.token == "t3"
+
+
+def test_401_plus_a_dead_door_is_still_a_refusal():
+    def post(url, body, timeout):
+        if url.startswith("http://door-a"):
+            return 401, {"detail": "no key"}
+        raise OSError("down")
+
+    with pytest.raises(LeaseRefused):
+        acquire("arc", 8000, door_bases=BASES, post=post)

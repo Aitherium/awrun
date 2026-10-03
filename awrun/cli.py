@@ -121,6 +121,12 @@ def _register_capacity_provider() -> None:
         token_source = getattr(host, "github_token_source", None)
         if callable(token_source) and plugins.get(plugins.GITHUB_TOKEN_SOURCE) is None:
             plugins.register(plugins.GITHUB_TOKEN_SOURCE, token_source)
+        # The host's lease client carries the host's door credentials. Without it a
+        # GPU-kind run asks the door with awrun's stdlib client, which holds no key:
+        # the door answers 401 and the run can never be leased.
+        lease_client = getattr(host, "gpu_lease_client", None)
+        if callable(lease_client) and plugins.get(plugins.GPU_LEASE_CLIENT) is None:
+            plugins.register(plugins.GPU_LEASE_CLIENT, lease_client)
     except (ImportError, AttributeError) as exc:
         # Absent is FINE for a stranger: awrun ships to PyPI and still measures
         # saturation without a provisioner. But on a host that plainly HAS the

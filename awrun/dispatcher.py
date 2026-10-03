@@ -1139,6 +1139,12 @@ def main() -> int:
         with trail.scratch_log():
             return _self_test()
 
+    # Same host hooks the CLI registers (capacity, token source, GPU lease client).
+    # A dispatcher started as `python -m awrun.dispatcher` never went through the
+    # CLI, so its GPU-kind runs asked the door with no credentials.
+    from awrun.cli import _register_capacity_provider
+    _register_capacity_provider()
+
     store = get_store()
     if args.once:
         result = dispatch_once(store, worker_id=args.worker_id)
