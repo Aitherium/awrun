@@ -62,6 +62,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
@@ -335,6 +336,55 @@ def _real_run_comet_deploy(item: RunItem) -> tuple[int, str]:
     # out early.
     code = 0 if status == "succeeded" else 1
     return code, json.dumps(payload)[:4000]
+
+
+_LAB_URL_ENV = "AITHER_LAB_URL"
+#: Same "execution gated, not design gated" rule as comet-deploy: a lab run can rent
+#: cloud GPUs, so dispatch is OFF until an owner turns it on for this worker.
+_ALLOW_REAL_LAB_ENV = "AWRUN_ALLOW_REAL_LAB_RUN"
+
+
+def lab_run_enabled() -> bool:
+    return os.getenv(_ALLOW_REAL_LAB_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _real_run_lab_run(item: RunItem) -> tuple[int, str]:
+    """Start a registered experiment via the lab service's `/experiments/{name}/run`.
+
+    Exit 0 means the lab ACCEPTED the run and returned its id, not that it finished:
+    a run lasts hours and reports its own progress (and failure) on its own surfaces.
+    """
+    if not lab_run_enabled():
+        return 1, (f"real lab-run dispatch is OFF (set {_ALLOW_REAL_LAB_ENV}=1 to enable) -- "
+                   f"an experiment run can rent billed GPUs")
+    name = str(item.spec.get("experiment") or "").strip()
+    if not name:
+        return 1, "spec.experiment is required (the registered experiment name)"
+    url = os.getenv(_LAB_URL_ENV, "").strip().rstrip("/")
+    if not url:
+        return 1, (f"{_LAB_URL_ENV} is not set. awrun ships no default lab address on "
+                   f"purpose -- set it to the lab service's base URL as reachable from "
+                   f"this worker.")
+    body = {k: item.spec[k] for k in ("targets", "budget_cap_usd", "skip_finetune")
+            if k in item.spec}
+    req = urllib.request.Request(
+        f"{url}/experiments/{urllib.parse.quote(name, safe='')}/run",
+        data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return 1, f"lab /experiments/{name}/run returned {exc.code}: {exc.read()[:2000]!r}"
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return 1, f"could not reach the lab service at {url}: {exc}"
+    except json.JSONDecodeError as exc:
+        return 1, f"lab /experiments/{name}/run returned non-JSON: {exc}"
+    run_id = payload.get("run_id") if isinstance(payload, dict) else None
+    if not run_id:
+        return 1, f"lab accepted no run (no run_id): {json.dumps(payload)[:2000]}"
+    return 0, json.dumps(payload)[:4000]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -634,6 +684,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "solve": _real_run_solve,
     "tunnel": _real_run_tunnel,
     "flow": _real_run_flow,
+    "lab-run": _real_run_lab_run,
 }
 
 

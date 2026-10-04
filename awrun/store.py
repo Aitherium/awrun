@@ -84,7 +84,11 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 #: `flow` (2026-09-21): a journaled workflow (`module:function`, or a script path
 #: plus a function name). The run id IS the journal id, so a suspended flow
 #: resumes by replaying the calls it already made instead of making them again.
-KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow")
+#: `lab-run` (2026-10-04): start a registered experiment through the lab service's own
+#: run route. Spend-gated at submit like comet-deploy; the run itself still waits on
+#: its own spend approval before anything is rented.
+KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow",
+         "lab-run")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease

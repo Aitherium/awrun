@@ -25,14 +25,18 @@ from typing import Any, Optional
 #: `tunnel` (2026-09-19): a public hostname is perimeter, so it is gated like a spend.
 COMET_DEPLOY_PERMISSION = "awrun:submit:comet-deploy"
 TUNNEL_PERMISSION = "awrun:submit:tunnel"
+#: `lab-run` (2026-10-04): an experiment run can rent cloud GPUs, so it is a spend.
+LAB_RUN_PERMISSION = "awrun:submit:lab-run"
 KIND_PERMISSIONS: dict[str, str] = {
     "comet-deploy": COMET_DEPLOY_PERMISSION,
     "tunnel": TUNNEL_PERMISSION,
+    "lab-run": LAB_RUN_PERMISSION,
 }
 #: Who may submit each gated kind, one env var per kind (comma-separated subject ids).
 KIND_OPERATORS_ENV: dict[str, str] = {
     "comet-deploy": "AWRUN_COMET_DEPLOY_OPERATORS",
     "tunnel": "AWRUN_TUNNEL_OPERATORS",
+    "lab-run": "AWRUN_LAB_RUN_OPERATORS",
 }
 
 

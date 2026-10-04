@@ -265,6 +265,15 @@ def _build_spec(args: argparse.Namespace) -> dict:
     elif kind in ("render", "artpack", "solve"):
         raise RunError(f"--kind {kind} is host-registered: its owner submits it with "
                        f"the spec that worker understands (RunStore.submit), not this CLI")
+    elif kind == "lab-run":
+        name = (getattr(args, "experiment", None) or "").strip()
+        if not name or "/" in name:
+            raise RunError("--experiment is required for --kind lab-run (a registered "
+                           "experiment name, no slashes)")
+        spec = {"experiment": name,
+                "skip_finetune": not getattr(args, "with_finetune", False)}
+        if getattr(args, "budget_cap_usd", None) is not None:
+            spec["budget_cap_usd"] = float(args.budget_cap_usd)
     elif kind == "flow":
         entry = getattr(args, "entry", None) or ""
         script = getattr(args, "script", None) or ""
@@ -840,6 +849,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--origin", help="[kind=tunnel] scheme://host:port (expose only)")
     submit.add_argument("--plane", choices=list(_TUNNEL_PLANES), default="tunnel",
                          help="[kind=tunnel] which plane serves the hostname")
+
+    submit.add_argument("--experiment", help="[kind=lab-run] registered experiment name")
+    submit.add_argument("--budget-cap-usd", dest="budget_cap_usd", type=float,
+                         help="[kind=lab-run] override the experiment's budget cap")
+    submit.add_argument("--with-finetune", dest="with_finetune", action="store_true",
+                         help="[kind=lab-run] run the fine-tune phase (skipped by default)")
 
     submit.add_argument("--entry", help="[kind=flow] module:function of the workflow")
     submit.add_argument("--script", help="[kind=flow] path to a workflow script")
