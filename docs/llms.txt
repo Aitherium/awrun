@@ -1,0 +1,39 @@
+# awrun
+
+> A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds. It also judges whether the runner pool is big enough for the queue it is draining, and can ask a host to grow it -- reserving capacity is zero-sum, so a saturated pool needs more of it, not a different share of it.
+
+A shared runner pool serves whoever asked first, so an urgent one-line fix waits behind a queue of speculative work — and the only lever anyone has is asking people to stop pushing.
+
+## Install
+
+```
+pip install awrun
+```
+
+## Use it in 30 seconds
+
+Queue two runs at different priorities and watch the urgent one overtake.
+
+## Composes with
+
+- [awdk](https://aitherium.github.io/awdk/) — Build AI agent fleets — 3 lines, any backend, local or cloud.
+- [awrelay](https://aitherium.github.io/awrelay/) — Portable agent messaging — findings, alerts, coordination.
+- [awevolve](https://aitherium.github.io/awevolve/) — Point an agent at a file and a command that scores it, and let it improve.
+- [awrise](https://aitherium.github.io/awrise/) — Wake an agent on a schedule, let it do one thing, and put it back to sleep.
+- [awpool](https://aitherium.github.io/awpool/) — The free half of the elastic work pool: dispatches public-safe work onto the free GitHub-hosted runners of the public aw* mirrors, so their idle CI minutes become compute. awrun remains the paid/self-hosted lane; this is its free twin.
+- [awflow](https://aitherium.github.io/awflow/) — A deterministic workflow runtime — chain agent calls with journal replay and budget control.
+- [awiam](https://aitherium.github.io/awiam/) — Who is this caller? A directory and session store that fails honestly.
+- [awbac](https://aitherium.github.io/awbac/) — Role-based access control that fails closed and explains itself.
+- [awdit](https://aitherium.github.io/awdit/) — An append-only audit trail whose gaps are DETECTABLE.
+- [awseal](https://aitherium.github.io/awseal/) — Sign an artifact so a stranger can verify it.
+- [awshare](https://aitherium.github.io/awshare/) — Publish an artifact and fetch it back verified.
+
+## Where it lives
+
+- Repo: https://github.com/Aitherium/awrun
+- Docs: https://aitherium.github.io/awrun/
+- Manifest (keys + the one-line adoption story): https://aitherium.github.io/awrun/aither-manifest.json
+
+This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-awrun.yml`; hand edits made here are overwritten on the next sync — change the source instead.
+
+Everything Aitherium, in one file for agents: https://aitherium.com/llms.txt
