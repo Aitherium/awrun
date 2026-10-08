@@ -248,6 +248,8 @@ def _build_spec(args: argparse.Namespace) -> dict:
             raise RunError("--workflow is required for --kind ci")
         spec["workflow"] = args.workflow
         spec["ref"] = getattr(args, "ref", None) or "develop"
+        if getattr(args, "repo", None):
+            spec["repo"] = args.repo
         inputs = {}
         for kv in getattr(args, "field", None) or []:
             if "=" not in kv:
@@ -833,6 +835,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="[kind=agent] extra argv passed to `adk chat`")
     submit.add_argument("--workflow", help="[kind=ci] workflow file name")
     submit.add_argument("--ref", help="[kind=ci] git ref (default: develop)")
+    submit.add_argument("--repo", help="[kind=ci] OWNER/REPO the workflow lives in (default: "
+                                       "the dispatcher's cwd repo, or $GH_REPO)")
     submit.add_argument("--field", action="append",
                          help="[kind=ci] workflow_dispatch input as key=value, repeatable")
     submit.add_argument("--service-name", dest="service_name",

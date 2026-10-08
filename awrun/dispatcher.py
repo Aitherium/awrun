@@ -65,10 +65,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from awrun import confine, host_admission, trail
-from awrun.store import GPU_KINDS, RunItem, RunStore, get_store
+from awrun.store import GPU_KINDS, KINDS, RunItem, RunStore, get_store
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +233,12 @@ def _build_ci_argv(item: RunItem) -> Optional[list[str]]:
         return None
     ref = item.spec.get("ref") or "develop"
     argv = ["gh", "workflow", "run", workflow, "--ref", ref]
+    # Without --repo, gh resolves the repo from the dispatcher's cwd: a dispatcher
+    # started outside a checkout failed every ci item with "not a git repository"
+    # (measured 2026-10-08). spec.repo pins it; $GH_REPO still works when unset.
+    repo = str(item.spec.get("repo") or "")
+    if repo:
+        argv += ["--repo", repo]
     for key, value in (item.spec.get("inputs") or {}).items():
         argv += ["-f", f"{key}={value}"]
     return argv
@@ -691,8 +697,15 @@ _RUN_FNS: dict[str, RunFn] = {
 def dispatch_once(store: RunStore, *, worker_id: str,
                    run_fns: Optional[dict[str, RunFn]] = None,
                    relay_client=None, lease_client=None,
-                   now_fn: Callable[[], float] = time.time) -> Optional[RunItem]:
-    """Claim and run the single highest-priority queued item, of ANY kind.
+                   now_fn: Callable[[], float] = time.time,
+                   kinds: Optional[Iterable[str]] = None,
+                   run_ids: Optional[Iterable[str]] = None) -> Optional[RunItem]:
+    """Claim and run the single highest-priority queued item, of ANY kind --
+    unless `kinds` / `run_ids` narrow it. A lane draining its OWN work passes
+    them: an unfiltered `--once` claimed the top item of any kind, and a CI-only
+    lane failed four queued `solve` runs it had no handler for (measured
+    2026-10-08). A filtered dispatcher never touches an item outside its filter;
+    the item stays queued, untouched, for its own worker.
     Returns the finished item, or None if there was nothing claimable —
     that is the ordinary "queue is empty" (or "everything claimable is
     lease-blocked") outcome, not an error.
@@ -705,7 +718,14 @@ def dispatch_once(store: RunStore, *, worker_id: str,
     fns = run_fns if run_fns is not None else _RUN_FNS
     actor = os.environ.get("AITHER_ACTOR") or f"awrun:{worker_id}"
 
+    want_kinds = frozenset(kinds or ())
+    want_ids = frozenset(run_ids or ())
+
     def _skip(item: RunItem) -> bool:
+        if want_kinds and item.kind not in want_kinds:
+            return True
+        if want_ids and item.id not in want_ids:
+            return True
         return item.kind == "agent" and _lease_blocked(item, actor=actor)
 
     claimed = store.claim_next(worker_id=worker_id, skip=_skip, now=now_fn())
@@ -883,7 +903,9 @@ def dispatch_once(store: RunStore, *, worker_id: str,
 def run_forever(store: RunStore, *, worker_id: str, poll_interval: float = 5.0,
                  run_fns: Optional[dict[str, RunFn]] = None,
                  sleep_fn: Callable[[float], None] = time.sleep,
-                 max_iterations: Optional[int] = None, lease_client=None) -> int:
+                 max_iterations: Optional[int] = None, lease_client=None,
+                 kinds: Optional[Iterable[str]] = None,
+                 run_ids: Optional[Iterable[str]] = None) -> int:
     """Loop dispatching one item at a time. `max_iterations` exists only for
     tests -- production callers leave it None and rely on the process being
     stopped externally (a scheduled task's own lifecycle, or a signal)."""
@@ -891,7 +913,7 @@ def run_forever(store: RunStore, *, worker_id: str, poll_interval: float = 5.0,
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         result = dispatch_once(store, worker_id=worker_id, run_fns=run_fns,
-                               lease_client=lease_client)
+                               lease_client=lease_client, kinds=kinds, run_ids=run_ids)
         # A requeued item (gpu lease refused) is "nothing ran": sleep, or a queue
         # holding only refused work would spin on the door.
         if result is None or result.status == "queued":
@@ -1184,6 +1206,10 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="dispatch a single item and exit")
     ap.add_argument("--poll-interval", type=float, default=5.0)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--kind", action="append", default=[], choices=list(KINDS),
+                    help="only claim items of this kind (repeatable); others stay queued")
+    ap.add_argument("--run-id", dest="run_id", action="append", default=[],
+                    help="only claim this run id (repeatable); others stay queued")
     args = ap.parse_args()
 
     if args.self_test:
@@ -1198,7 +1224,8 @@ def main() -> int:
 
     store = get_store()
     if args.once:
-        result = dispatch_once(store, worker_id=args.worker_id)
+        result = dispatch_once(store, worker_id=args.worker_id,
+                               kinds=args.kind or None, run_ids=args.run_id or None)
         if result is None:
             print("nothing to dispatch")
             return 0
@@ -1207,7 +1234,8 @@ def main() -> int:
         # backoff. That is the queue working, not a failed dispatch.
         return 0 if result.status in ("done", "queued") else 1
 
-    return run_forever(store, worker_id=args.worker_id, poll_interval=args.poll_interval)
+    return run_forever(store, worker_id=args.worker_id, poll_interval=args.poll_interval,
+                       kinds=args.kind or None, run_ids=args.run_id or None)
 
 
 if __name__ == "__main__":
