@@ -23,8 +23,19 @@ import sys
 #: package cannot read the registry, and a doctor that guessed at the family
 #: would go stale in silence. Regenerate to update.
 SELF = 'awrun'
-FAMILY = ['awask', 'awavatar', 'awbac', 'awbrain', 'awbrowse', 'awcams', 'awclassify', 'awdecide', 'awdeck', 'awdelphi', 'awdit', 'awembed', 'awevolve', 'awfind', 'awflow', 'awfocus', 'awgit', 'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awmine', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpool', 'awpredict', 'awprism', 'awprove', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrena', 'awrepl', 'awreport', 'awresearch', 'awrise', 'awrouter', 'awrtifact', 'awscope', 'awscreen', 'awseal', 'awsettings', 'awshare', 'awsprite', 'awstorage', 'awsuite', 'awswarm', 'awtax', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall', 'gawbbonet']
-PAIRS_WITH = ['awbac', 'awdit', 'adk', 'awevolve', 'awflow', 'awiam', 'awpool', 'awrelay', 'awrise', 'awseal', 'awshare']
+FAMILY = [
+    'awask', 'awavatar', 'awbac', 'awbrain', 'awbrowse', 'awcams', 'awclassify', 'awdecide',
+    'awdeck', 'awdelphi', 'awdit', 'awembed', 'awevolve', 'awfind', 'awflow', 'awfocus', 'awgit',
+    'awgraph', 'awgym', 'awiam', 'awkno', 'awm', 'awmail', 'awmine', 'awnboard', 'awnest', 'awnet',
+    'awplay', 'awpool', 'awpredict', 'awprism', 'awprove', 'awreason', 'awrecover', 'awrecurse',
+    'awrelay', 'awrena', 'awrepl', 'awreport', 'awresearch', 'awrise', 'awrouter', 'awrtifact',
+    'awscope', 'awscreen', 'awseal', 'awsettings', 'awshare', 'awsprite', 'awstorage', 'awsuite',
+    'awswarm', 'awtax', 'awtoll', 'awtunnel', 'awvision', 'awvoice', 'awwall', 'gawbbonet',
+]
+PAIRS_WITH = [
+    'awbac', 'awdit', 'adk', 'awevolve', 'awflow', 'awiam', 'awpool', 'awrelay', 'awrise', 'awseal',
+    'awshare',
+]
 
 #: This brick's OWN config, read out of its source at generation time.
 #: ENV_REQUIRED is `os.environ["X"]` -- absent, that is a KeyError the moment
@@ -33,7 +44,11 @@ PAIRS_WITH = ['awbac', 'awdit', 'adk', 'awevolve', 'awflow', 'awiam', 'awpool', 
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
 ENV_REQUIRED = []
-ENV_OPTIONAL = ['AWRUN_AUDIT_LOG', 'AWRUN_CAPACITY_PLUGIN', 'AWRUN_CA_BUNDLE', 'AWRUN_COMET_DEPLOY_OPERATORS', 'AWRUN_FLOW_FAKE_DISPATCHER', 'AWRUN_HOST_ADMISSION', 'AWRUN_HOST_BUDGET', 'AWRUN_IAM_DIRECTORY']
+ENV_OPTIONAL = [
+    'AWRUN_AUDIT_LOG', 'AWRUN_CAPACITY_PLUGIN', 'AWRUN_CA_BUNDLE', 'AWRUN_COMET_DEPLOY_OPERATORS',
+    'AWRUN_FLOW_FAKE_DISPATCHER', 'AWRUN_HOST_ADMISSION', 'AWRUN_HOST_BUDGET',
+    'AWRUN_IAM_DIRECTORY',
+]
 
 
 def _installed(mod: str) -> "str | None":
