@@ -87,8 +87,12 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 #: `lab-run` (2026-10-04): start a registered experiment through the lab service's own
 #: run route. Spend-gated at submit like comet-deploy; the run itself still waits on
 #: its own spend approval before anything is rented.
+#: `node-op` (2026-10-08): provision / recover / check models on an owner mesh node
+#: (ssh + the host's memory budget). Host-registered like `tunnel`: awrun stays free of
+#: ssh and nodes.yaml; `services.mesh.awrun_node_op` is the RunFn. Authz-gated at
+#: submit -- a model load that does not fit took a Windows host down that day.
 KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow",
-         "lab-run")
+         "lab-run", "node-op")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease

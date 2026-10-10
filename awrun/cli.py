@@ -237,6 +237,71 @@ def _submit_tunnel_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
+_NODE_OP_ACTIONS = ("provision", "recover", "check")
+
+
+def _parse_node_model(raw: str) -> dict:
+    """`name=/abs/path.gguf[:pin|:ondemand]` -> {"name", "path", "pinned"?}. Without a
+    suffix the executor decides (a model >= 8 GiB is on-demand)."""
+    if "=" not in raw:
+        raise RunError(f"--model must be name=/abs/path.gguf[:pin|:ondemand], got {raw!r}")
+    name, path = (p.strip() for p in raw.split("=", 1))
+    entry: dict = {"name": name}
+    for suffix, pinned in ((":pin", True), (":ondemand", False)):
+        if path.endswith(suffix):
+            path, entry["pinned"] = path[: -len(suffix)], pinned
+    if not name or not path.startswith("/") or " " in name:
+        raise RunError(f"--model needs a name and an absolute node path, got {raw!r}")
+    entry["path"] = path
+    return entry
+
+
+def _submit_node_op_spec(args: argparse.Namespace) -> dict:
+    """The `node-op` RunItem spec, validated at submit. --spec-json is the base and
+    flags override it, so `awrun submit --kind node-op --spec-json '{...}'` works too."""
+    spec: dict = {}
+    raw = getattr(args, "spec_json", None)
+    if raw:
+        try:
+            spec.update(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            raise RunError(f"--spec-json is not valid JSON: {exc}") from exc
+    if getattr(args, "node", None):
+        spec["node"] = args.node
+    if getattr(args, "action", None):
+        spec["action"] = args.action
+    models = [_parse_node_model(m) for m in (getattr(args, "model", None) or [])]
+    if models:
+        spec["models"] = models
+    if getattr(args, "headroom_gb", None) is not None:
+        spec["headroom_gb"] = args.headroom_gb       # validated below
+    if getattr(args, "node_dry_run", False):
+        spec["dry_run"] = True
+    node = str(spec.get("node") or "").strip()
+    if not node or "/" in node or " " in node:
+        raise RunError(f"--node must name a nodes.yaml entry, got {node!r}")
+    if spec.get("action") not in _NODE_OP_ACTIONS:
+        raise RunError(f"--action must be one of {_NODE_OP_ACTIONS} for --kind node-op, "
+                       f"got {spec.get('action')!r}")
+    if spec["action"] == "provision" and not spec.get("models"):
+        raise RunError("--action provision needs at least one --model name=/path.gguf")
+    for m in spec.get("models") or []:
+        if not isinstance(m, dict) or not m.get("name") or not str(
+                m.get("path") or "").startswith("/"):
+            raise RunError(f"every model needs a name and an absolute path, got {m!r}")
+    if "headroom_gb" in spec:
+        # a caller may only RAISE headroom (the executor clamps up to the node's floor);
+        # zero, negative or non-numeric is refused here, before anything is queued
+        try:
+            ok = float(spec["headroom_gb"]) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise RunError(f"headroom_gb must be a number > 0, got {spec['headroom_gb']!r}")
+        spec["headroom_gb"] = float(spec["headroom_gb"])
+    return spec
+
+
 def _build_spec(args: argparse.Namespace) -> dict:
     """The run's spec from parsed arguments. PURE -- it authorizes nothing and
     writes nothing, so `apply` can compare a manifest to the queue before it
@@ -264,6 +329,8 @@ def _build_spec(args: argparse.Namespace) -> dict:
                            "(or set it in --spec-json)")
     elif kind == "tunnel":
         spec = _submit_tunnel_spec(args)
+    elif kind == "node-op":
+        spec = _submit_node_op_spec(args)
     elif kind in ("render", "artpack", "solve"):
         raise RunError(f"--kind {kind} is host-registered: its owner submits it with "
                        f"the spec that worker understands (RunStore.submit), not this CLI")
@@ -686,7 +753,8 @@ def _self_test() -> int:
         )
         old_env = {k: os.environ.pop(k, None) for k in
                    ("AITHER_SESSION_BEARER", "AWRUN_COMET_DEPLOY_OPERATORS",
-                    "AWRUN_TUNNEL_OPERATORS", "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
+                    "AWRUN_TUNNEL_OPERATORS", "AWRUN_NODE_OP_OPERATORS",
+                    "AWRUN_IAM_DIRECTORY", "AWRUN_AUDIT_LOG")}
         try:
             # Pointed at the scratch dir BEFORE the first submit: the denial below
             # is audited, and a self-test must not write the operator's real trail.
@@ -753,6 +821,23 @@ def _self_test() -> int:
                       rc6 == 0 and len(queued_t) == 1 and queued_t[0].spec == {
                           "action": "expose", "hostname": "demo.example.com",
                           "origin": "http://app-web:3000", "plane": "tunnel"})
+
+                # ── kind=node-op: its own operator list again ──
+                node_args = argparse.Namespace(
+                    kind="node-op", priority=0, paths=[], json=False, node="optiplex-wsl",
+                    action="provision", spec_json=None, headroom_gb=None,
+                    node_dry_run=False, model=["qwen=/m/q.gguf:ondemand"])
+                os.environ.pop("AWRUN_NODE_OP_OPERATORS", None)
+                rc7 = cmd_submit(node_args, store)
+                check("a tunnel operator is NOT thereby a node-op operator (exit 1)",
+                      rc7 == 1 and "node-op-denied" in audit_path.read_text()
+                      and not store.list(statuses=["queued"], kind="node-op"))
+                os.environ["AWRUN_NODE_OP_OPERATORS"] = "ops-dave"
+                rc8 = cmd_submit(node_args, store)
+                queued_n = store.list(statuses=["queued"], kind="node-op")
+                check("a node-op operator's provision reaches the queue",
+                      rc8 == 0 and len(queued_n) == 1 and queued_n[0].spec["models"] == [
+                          {"name": "qwen", "path": "/m/q.gguf", "pinned": False}])
             bad = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                      action="retire", hostname="demo.example.com",
                                      origin="http://x:1", plane="tunnel")
@@ -847,12 +932,21 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--spec-json", dest="spec_json",
                          help="[kind=comet-deploy] full AitherComet DeployRequest body as "
                               "a JSON object; --service-name/--target override matching keys")
-    submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS),
-                         help="[kind=tunnel] expose a hostname, or retire it")
+    submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS + _NODE_OP_ACTIONS),
+                         help="[kind=tunnel] expose|retire; [kind=node-op] "
+                              "provision|recover|check")
     submit.add_argument("--hostname", help="[kind=tunnel] the public FQDN")
     submit.add_argument("--origin", help="[kind=tunnel] scheme://host:port (expose only)")
     submit.add_argument("--plane", choices=list(_TUNNEL_PLANES), default="tunnel",
                          help="[kind=tunnel] which plane serves the hostname")
+
+    submit.add_argument("--node", help="[kind=node-op] the config/nodes.yaml entry")
+    submit.add_argument("--model", action="append",
+                         help="[kind=node-op] name=/abs/path.gguf[:pin|:ondemand], repeatable")
+    submit.add_argument("--headroom-gb", dest="headroom_gb", type=float,
+                         help="[kind=node-op] memory kept free (default: nodes.yaml mem_guard)")
+    submit.add_argument("--node-dry-run", dest="node_dry_run", action="store_true",
+                         help="[kind=node-op] admit/plan only, change nothing on the node")
 
     submit.add_argument("--experiment", help="[kind=lab-run] registered experiment name")
     submit.add_argument("--budget-cap-usd", dest="budget_cap_usd", type=float,

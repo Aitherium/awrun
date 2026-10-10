@@ -7,7 +7,7 @@ task (matching `AitherOS/config/routines/*.yaml`'s existing pattern) or a
 one-shot `--once` invocation. One fewer always-on service is one fewer thing
 that can silently die without anyone noticing.
 
-Eight kinds, eight handlers, one dispatch loop:
+Ten kinds, ten handlers, one dispatch loop:
 
 * `agent`        — Phase 1 (done). `adk chat <agent> "<task>"`.
 * `ci`            — Phase 2 (done). `gh workflow run <workflow> --ref <ref> -f k=v...`.
@@ -23,6 +23,14 @@ Eight kinds, eight handlers, one dispatch loop:
   (required for expose, forbidden for retire), "plane": "tunnel"|"pages"|"worker"}`.
   Submit is authz-gated (`awrun:submit:tunnel`) like comet-deploy: a public
   hostname is perimeter. The executor is the tunnel plane's one writer, not awrun.
+* `lab-run`       -- start a registered experiment through the lab service's run route.
+  Spend-gated at submit (`awrun:submit:lab-run`); the run still waits on its own spend
+  approval before anything is rented.
+* `node-op`       -- host-registered (2026-10-08). Spec: `{"node": "<nodes.yaml name>",
+  "action": "provision"|"recover"|"check", "models": [{"name", "path", "pinned"?}],
+  "headroom_gb"?, "dry_run"?}`. Submit is authz-gated (`awrun:submit:node-op`): a model
+  load that does not fit takes the node's host down. The executor is
+  `services.mesh.awrun_node_op` (ssh + memory admission), never awrun.
 * `flow`          -- a journaled workflow in a child process. The run id is the
   journal id, so a flow that was suspended (or killed) continues from its journal:
   the calls it already made are replayed, not made again.
@@ -572,6 +580,7 @@ _real_run_render = _host_registered_gap("render", "a media render")
 _real_run_artpack = _host_registered_gap("artpack", "a character art pack bake")
 _real_run_solve = _host_registered_gap("solve", "a problem-solving session")
 _real_run_tunnel = _host_registered_gap("tunnel", "opening or retiring a public hostname")
+_real_run_node_op = _host_registered_gap("node-op", "provisioning or recovering a mesh node")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -691,6 +700,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "tunnel": _real_run_tunnel,
     "flow": _real_run_flow,
     "lab-run": _real_run_lab_run,
+    "node-op": _real_run_node_op,
 }
 
 

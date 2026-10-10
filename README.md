@@ -80,6 +80,8 @@ urgent item can jump.
 | `solve` | host-registered: a problem-solving session |
 | `flow` | a journaled workflow in a child process; resumes by replay |
 | `tunnel` | host-registered: expose or retire a public hostname on a plane (tunnel/pages/worker); submit is authz-gated like `comet-deploy` |
+| `lab-run` | start a registered experiment through the lab service; spend-gated at submit like `comet-deploy` |
+| `node-op` | host-registered: provision, recover or check models on an owner mesh node behind a memory admission check; submit is authz-gated (`AWRUN_NODE_OP_OPERATORS`) |
 
 > This section used to say `kind=agent` dispatch only, and list `kind=ci` among
 > "the next phases", while ci was implemented, routed and covered by a

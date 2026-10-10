@@ -27,7 +27,10 @@ COMET_DEPLOY_PERMISSION = "awrun:submit:comet-deploy"
 TUNNEL_PERMISSION = "awrun:submit:tunnel"
 #: `lab-run` (2026-10-04): an experiment run can rent cloud GPUs, so it is a spend.
 LAB_RUN_PERMISSION = "awrun:submit:lab-run"
+#: `node-op` (2026-10-08): loading a model that does not fit takes a host down.
+NODE_OP_PERMISSION = "awrun:submit:node-op"
 KIND_PERMISSIONS: dict[str, str] = {
+    "node-op": NODE_OP_PERMISSION,
     "comet-deploy": COMET_DEPLOY_PERMISSION,
     "tunnel": TUNNEL_PERMISSION,
     "lab-run": LAB_RUN_PERMISSION,
@@ -37,6 +40,7 @@ KIND_OPERATORS_ENV: dict[str, str] = {
     "comet-deploy": "AWRUN_COMET_DEPLOY_OPERATORS",
     "tunnel": "AWRUN_TUNNEL_OPERATORS",
     "lab-run": "AWRUN_LAB_RUN_OPERATORS",
+    "node-op": "AWRUN_NODE_OP_OPERATORS",
 }
 
 
