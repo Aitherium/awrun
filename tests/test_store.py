@@ -165,7 +165,7 @@ def test_gpu_kinds_refuse_submit_without_a_gpu_request(store, kind):
 
 
 def test_gpu_kinds_are_exactly_render_artpack_solve():
-    assert GPU_KINDS == frozenset({"render", "artpack", "solve"})
+    assert GPU_KINDS == frozenset({"render", "artpack", "solve", "blender-frame"})
 
 
 def test_gpu_request_is_normalised_with_defaults(store):

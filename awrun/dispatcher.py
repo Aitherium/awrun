@@ -581,6 +581,7 @@ _real_run_artpack = _host_registered_gap("artpack", "a character art pack bake")
 _real_run_solve = _host_registered_gap("solve", "a problem-solving session")
 _real_run_tunnel = _host_registered_gap("tunnel", "opening or retiring a public hostname")
 _real_run_node_op = _host_registered_gap("node-op", "provisioning or recovering a mesh node")
+_real_run_blender_frame = _host_registered_gap("blender-frame", "a Blender frame range")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -701,6 +702,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "flow": _real_run_flow,
     "lab-run": _real_run_lab_run,
     "node-op": _real_run_node_op,
+    "blender-frame": _real_run_blender_frame,
 }
 
 

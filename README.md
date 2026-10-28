@@ -78,6 +78,7 @@ urgent item can jump.
 | `render` | host-registered: a media render; the renderer passes its own `run_fns=` |
 | `artpack` | host-registered: a character art pack bake |
 | `solve` | host-registered: a problem-solving session |
+| `blender-frame` | host-registered: one frame range of a Blender proof for one named render host |
 | `flow` | a journaled workflow in a child process; resumes by replay |
 | `tunnel` | host-registered: expose or retire a public hostname on a plane (tunnel/pages/worker); submit is authz-gated like `comet-deploy` |
 | `lab-run` | start a registered experiment through the lab service; spend-gated at submit like `comet-deploy` |

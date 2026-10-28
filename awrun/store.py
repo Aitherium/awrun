@@ -91,14 +91,19 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 #: (ssh + the host's memory budget). Host-registered like `tunnel`: awrun stays free of
 #: ssh and nodes.yaml; `services.mesh.awrun_node_op` is the RunFn. Authz-gated at
 #: submit -- a model load that does not fit took a Windows host down that day.
+#: `blender-frame` (2026-10-28): one contiguous frame range of a Blender proof
+#: (construction film) for ONE named render host. Host-registered like `render`, and a
+#: separate kind on purpose: the Remotion `render` worker claims every `render` item, so
+#: a Blender range filed under `render` would be claimed by a worker that cannot run it.
+#: The owner is `AitherOS/dev/tools/awrun_blender_worker.py` (claims kinds=[blender-frame] only).
 KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow",
-         "lab-run", "node-op")
+         "lab-run", "node-op", "blender-frame")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease
 #: door, and "run it and see" is how a render walks onto a card with no free
 #: memory and dies eleven minutes in. Other kinds MAY carry one.
-GPU_KINDS = frozenset({"render", "artpack", "solve"})
+GPU_KINDS = frozenset({"render", "artpack", "solve", "blender-frame"})
 
 #: The priority classes a lease door arbitrates between, most urgent first.
 GPU_CLASSES = ("arc", "interactive_media", "chat", "training", "detection")
