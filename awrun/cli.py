@@ -503,7 +503,13 @@ def cmd_egress_proxy(args: argparse.Namespace, store: RunStore) -> int:
     if not host or not port.isdigit():
         print(f"ERROR: --listen must be host:port, got {args.listen!r}", file=sys.stderr)
         return 2
-    return egress.serve(host, int(port), args.allow or [])
+    try:
+        return egress.serve(host, int(port), args.allow or [],
+                            bindings_path=getattr(args, "bindings", None),
+                            upstream_ca=getattr(args, "upstream_ca", None))
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: --bindings: {exc}", file=sys.stderr)
+        return 2
 
 
 # ── apply: a manifest is the desired queue, and applying it twice is a no-op ──
@@ -1011,6 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  "confined run")
     proxy.add_argument("--listen", default="127.0.0.1:3128")
     proxy.add_argument("--allow", action="append", help="host[:port] or *.suffix; repeatable")
+    proxy.add_argument("--bindings", help="per-run JSON: placeholder -> vault secret NAME + "
+                                         "domains; the proxy injects the real value "
+                                         "(absolute-form HTTP only, never into CONNECT)")
+    proxy.add_argument("--upstream-ca", dest="upstream_ca",
+                       help="CA bundle for upstream TLS on upstream_tls bindings")
 
     bump = sub.add_parser("bump", help="change a queued/claimed run's priority",
                            parents=[json_flag])
