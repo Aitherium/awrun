@@ -45,6 +45,7 @@ outside the proxy's control.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import re
@@ -195,14 +196,22 @@ def load_bindings(path: str) -> list:
     return out
 
 
+#: Module that provides ``get_secret(name, default, use_env_fallback=...)`` on a
+#: host that ships a vault client. Not a dependency of this package.
+VAULT_CLIENT_MODULE = "lib.clients.aither_secrets"
+
+
 def vault_resolver(ref: str) -> str:
     """Resolve a vault NAME through the existing AitherSecrets client, server-side.
 
     No environment fallback: a vault miss is LOUD (the request gets 502), never a
     silent substitute value.
     """
+    # The vault client is an OPTIONAL host integration, resolved at call time by
+    # name: installed standalone it is absent and the resolver fails loudly; on a
+    # host that provides it the behaviour is unchanged.
     try:
-        from lib.clients.aither_secrets import get_secret  # type: ignore[import-not-found]
+        get_secret = importlib.import_module(VAULT_CLIENT_MODULE).get_secret
     except Exception as exc:   # noqa: BLE001 -- any import failure means no vault here
         raise CredentialUnavailableError(
             f"no vault client importable ({type(exc).__name__})") from None
