@@ -137,6 +137,137 @@ def _register_capacity_provider() -> None:
         plugins.PROVISION_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
+#: The host deployer file, relative to the checkout root. Loaded by PATH, like the
+#: capacity plugin, so the published package names no module it does not ship.
+_DEPLOYER_MARKER = ("AitherOS", "dev", "tools", "awrun_deployer.py")
+
+
+def _register_deployer() -> None:
+    """Register the host's agent deployer with awrun.plugins if one is available.
+
+    ``$AWRUN_DEPLOYER_PLUGIN`` names the file; else the checkout's host file. A
+    missing deployer is a normal state (``deploy`` then exits 2 and says why); the
+    reason is kept in ``plugins.DEPLOYER_IMPORT_ERROR`` rather than swallowed.
+    """
+    import importlib.util
+
+    from . import plugins
+
+    if plugins.get(plugins.AGENT_DEPLOYER) is not None:
+        return
+    override = os.environ.get("AWRUN_DEPLOYER_PLUGIN", "").strip()
+    if override:
+        path = Path(override)
+    else:
+        root = _monorepo_root()
+        if root is None:
+            plugins.DEPLOYER_IMPORT_ERROR = ("AWRUN_DEPLOYER_PLUGIN is unset and no "
+                                             "checkout marker was found")
+            return
+        path = root.joinpath(*_DEPLOYER_MARKER)
+    if not path.is_file():
+        plugins.DEPLOYER_IMPORT_ERROR = f"host deployer not found: {path}"
+        return
+    name = "_awrun_host_deployer_plugin"
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        plugins.register(plugins.AGENT_DEPLOYER, module.agent_deployer)
+    except Exception as exc:  # noqa: BLE001 - recorded for the one place that reports it
+        sys.modules.pop(name, None)
+        plugins.DEPLOYER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def _print_json(obj: object) -> None:
+    print(json.dumps(obj, indent=2, sort_keys=True, default=str))
+
+
+def cmd_deploy(args: argparse.Namespace, store: RunStore) -> int:
+    """Deploy an agent pack; prints what it will create, then does it."""
+    from . import deploy as _dp
+
+    if not args.dry_run:
+        _register_deployer()
+    code, out = _dp.deploy(args.agent, args.target, company=args.company,
+                           dry_run=args.dry_run)
+    if args.json:
+        _print_json(out)
+        return code
+    plan = out.get("plan") or {}
+    if plan:
+        print(f"{'would create' if args.dry_run else 'creates'}: {plan.get('creates')}")
+        print(f"  agent={plan.get('agent')} target={plan.get('target')} "
+              f"company={plan.get('company') or '(default)'}")
+        print(f"  record -> {plan.get('record_dir')}")
+    if args.dry_run:
+        print("dry run: no deployer was called"
+              + ("" if plan.get("backend_registered") else
+                 " (and none is registered in this process)"))
+        return code
+    if "deployment" not in out:
+        print(f"error: {out.get('error')}", file=sys.stderr)
+        return code
+    dep = out["deployment"]
+    if dep["status"] == _dp.STATUS_DEPLOYED:
+        print(f"{dep['id']} deployed via {dep['backend']}: handle={dep.get('handle')}"
+              + (f" endpoint={dep['endpoint']}" if dep.get("endpoint") else ""))
+    else:
+        print(f"{dep['id']} FAILED via {dep['backend']}: {dep.get('error')}", file=sys.stderr)
+        guidance = (dep.get("detail") or {}).get("guidance")
+        if guidance:
+            print(guidance, file=sys.stderr)
+    return code
+
+
+def cmd_ps(args: argparse.Namespace, store: RunStore) -> int:
+    """List deployment records with live status where the backend gives one."""
+    from . import deploy as _dp
+
+    _register_deployer()
+    rows = _dp.ps(include_removed=args.all)
+    if args.json:
+        _print_json(rows)
+        return 0
+    if not rows:
+        print("no deployments")
+        return 0
+    print(f"{'ID':<11} {'AGENT':<20} {'TARGET':<8} {'STATUS':<14} {'SOURCE':<26} HANDLE")
+    for r in rows:
+        src = r["status_source"] + (" (live)" if r["live"] else "")
+        print(f"{r['id']:<11} {r['agent'][:20]:<20} {r['target']:<8} "
+              f"{r['current_status'][:14]:<14} {src[:26]:<26} {r.get('handle') or '-'}")
+    if any(not r["live"] for r in rows):
+        print("note: a status not marked (live) is what was last recorded, not a probe")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace, store: RunStore) -> int:
+    """Tear a deployment down through the backend's own teardown (needs --yes)."""
+    from . import deploy as _dp
+
+    if args.yes:
+        _register_deployer()
+    code, out = _dp.rm(args.id, yes=args.yes)
+    if args.json:
+        _print_json(out)
+        return code
+    if "error" in out:
+        print(f"error: {out['error']}", file=sys.stderr)
+        if out.get("would"):
+            print(f"would: {out['would']}", file=sys.stderr)
+        return code
+    dep = out["deployment"]
+    print(f"{dep['id']} removed ({dep['agent']}, {dep['target']}); "
+          f"remote touched: {'yes' if dep.get('remote_touched') else 'NO'}")
+    if out.get("warning"):
+        print(out["warning"])
+    return code
+
+
 def _fmt_age(seconds: float) -> str:
     if seconds < 60:
         return f"{int(seconds)}s"
@@ -1041,6 +1172,24 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = sub.add_parser("cancel", help="withdraw a queued/claimed run", parents=[json_flag])
     cancel.add_argument("id")
 
+    deploy = sub.add_parser(
+        "deploy", parents=[json_flag],
+        help="deploy an agent pack (managed twin or local compile) and record it")
+    deploy.add_argument("agent", help="pack or agent name")
+    deploy.add_argument("--target", choices=("managed", "local"), default="managed")
+    deploy.add_argument("--company", default=None, help="pack company (host default)")
+    deploy.add_argument("--dry-run", action="store_true",
+                        help="print what would be created; call nothing")
+
+    ps_p = sub.add_parser("ps", parents=[json_flag],
+                          help="list agent deployments and their status")
+    ps_p.add_argument("--all", action="store_true", help="include removed deployments")
+
+    rm_p = sub.add_parser("rm", parents=[json_flag],
+                          help="tear down a deployment via the deployer's own teardown")
+    rm_p.add_argument("id", help="deployment id (d-xxxxxxxx)")
+    rm_p.add_argument("--yes", action="store_true", help="required: actually remove it")
+
     groups = sub.add_parser(
         "groups", parents=[json_flag],
         help="reserved CI capacity: which workflows may never queue behind CI")
@@ -1348,6 +1497,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "groups": cmd_groups,
         "capacity": cmd_capacity,
         "surface": cmd_surface,
+        "deploy": cmd_deploy,
+        "ps": cmd_ps,
+        "rm": cmd_rm,
     }
     return handlers[args.command](args, store)
 

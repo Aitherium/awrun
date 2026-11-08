@@ -46,6 +46,14 @@ GPU_LEASE_CLIENT = "gpu_lease_client"
 #: fallback is tried. awrun itself knows no vault.
 GITHUB_TOKEN_SOURCE = "github_token_source"
 
+#: () -> an agent deployer backend (see awrun/deploy.py for its shape). Used by
+#: `awrun deploy`, `awrun ps` and `awrun rm`; awrun records deployments, the host
+#: owns the act of creating or tearing one down.
+AGENT_DEPLOYER = "agent_deployer"
+
+#: Why the host deployer failed to load, when it did. None = never tried / loaded.
+DEPLOYER_IMPORT_ERROR = None
+
 #: Why the host provisioner failed to import, when it did. None means it was
 #: never attempted or it succeeded. Recorded rather than swallowed: a silent
 #: ImportError leaves `awrun capacity --add` exiting 0 having done nothing,
