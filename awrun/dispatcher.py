@@ -65,6 +65,7 @@ import argparse
 import json
 import logging
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -303,6 +304,30 @@ def _comet_url() -> str:
     return os.getenv(_COMET_URL_ENV, "").strip().rstrip("/")
 
 
+def _ca_bundle() -> Optional[str]:
+    """The CA bundle this host named, or None: `AWRUN_CA_BUNDLE`, else the
+    standard `SSL_CERT_FILE`. A name that is not a file is ignored, so a typo
+    falls back to the system store instead of trusting nothing or everything."""
+    ca = os.environ.get("AWRUN_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    return ca if ca and os.path.isfile(ca) else None
+
+
+def _https_context(url: str) -> Optional[ssl.SSLContext]:
+    """A verifying TLS context for an https URL (None for plain http).
+
+    A fleet runs its own PKI, so its deployment service presents a certificate
+    no public root signs. The context trusts the system store PLUS the bundle
+    from `_ca_bundle()`; the certificate chain and the host name are checked
+    either way. There is no switch here that turns verification off."""
+    if not url.lower().startswith("https://"):
+        return None
+    ctx = ssl.create_default_context()
+    ca = _ca_bundle()
+    if ca:
+        ctx.load_verify_locations(cafile=ca)
+    return ctx
+
+
 def _real_run_comet_deploy(item: RunItem) -> tuple[int, str]:
     if not comet_deploy_enabled():
         return 1, (f"real comet-deploy dispatch is OFF (set {_ALLOW_REAL_ENV}=1 to enable) -- "
@@ -322,11 +347,19 @@ def _real_run_comet_deploy(item: RunItem) -> tuple[int, str]:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=300, context=_https_context(url)) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return 1, f"AitherComet /deploy returned {exc.code}: {exc.read()[:2000]!r}"
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        if isinstance(getattr(exc, "reason", exc), ssl.SSLCertVerificationError):
+            # Said plainly, with the fix: "could not reach" reads as a dead
+            # service, and the tempting answer to a certificate error is to stop
+            # checking certificates.
+            return 1, (f"the deployment service at {url} presented a certificate this host "
+                       f"does not trust ({getattr(exc, 'reason', exc)}). Point AWRUN_CA_BUNDLE "
+                       f"(or SSL_CERT_FILE) at the CA bundle that signs it; awrun does not "
+                       f"turn verification off.")
         return 1, f"could not reach the deployment service at {url}: {exc}"
     except json.JSONDecodeError as exc:
         return 1, f"AitherComet /deploy returned non-JSON: {exc}"
@@ -489,10 +522,7 @@ class _AgentLane:
         # a CA-BUNDLE PATH, and httpx accepts exactly that in `verify=`; the fleet
         # sets the path, and off-fleet `True` uses the system store, which is the
         # correct default for a stranger. Same trust on-fleet, no coupling.
-        verify: object = True
-        _ca = os.environ.get("AWRUN_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
-        if _ca and os.path.isfile(_ca):
-            verify = _ca
+        verify: object = _ca_bundle() or True
         r = httpx.post(
             f"{self._base}/v1/agent/message",
             headers={"Authorization": f"Bearer {self._token}"},

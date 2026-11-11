@@ -40,9 +40,10 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 STATUS_QUEUED = "queued"
 STATUS_CLAIMED = "claimed"
@@ -331,6 +332,41 @@ class RunItem:
         return cls(**{k: v for k, v in raw.items() if k in known})
 
 
+#: How long a rename waits out a Windows sharing violation: 12 tries, the
+#: pause doubling from 5 ms to a 100 ms cap, a little under a second in all.
+_SHARING_TRIES = 12
+
+#: A move holds its item's lock for milliseconds. One this old belongs to a
+#: process that died mid-move and is taken over.
+_LOCK_STALE_S = 30.0
+
+#: How long a move waits for another move of the same item to finish.
+_LOCK_WAIT_S = 2.0
+
+
+def _when_unshared(fn: Callable[..., Any], src: Any, dst: Any) -> Any:
+    """Call `fn(src, dst)` (os.rename / os.replace), waiting out a sharing violation.
+
+    Windows refuses to rename or replace a file for the milliseconds another
+    process has it open -- a second worker reading the queue, `awrun queue`, a
+    virus scanner -- and raises PermissionError. POSIX never refuses for that
+    reason. One worker alone almost never met it; several on one queue do
+    (measured 2026-11-10: 19 of 120 claims with six claimers). The call is
+    retried briefly and then the error is raised as before: a real permission
+    problem is not hidden, only delayed by under a second. FileNotFoundError
+    and FileExistsError pass straight through; they are the race's answer."""
+    pause = 0.005
+    for attempt in range(_SHARING_TRIES):
+        try:
+            return fn(src, dst)
+        except PermissionError:
+            if attempt == _SHARING_TRIES - 1:
+                raise
+            time.sleep(pause)
+            pause = min(pause * 2, 0.1)
+    return None  # pragma: no cover - the loop returns or raises
+
+
 class RunStore:
     """Disk-backed run queue. Safe across processes; cheap enough to poll."""
 
@@ -368,7 +404,7 @@ class RunStore:
         target = self._file_in(status, item.id)
         tmp = target.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(item.to_dict(), indent=2), encoding="utf-8")
-        os.replace(tmp, target)
+        _when_unshared(os.replace, tmp, target)
 
     def submit(self, kind: str, spec: dict[str, Any], *,
                priority: int = 0, paths: Optional[list[str]] = None,
@@ -422,35 +458,94 @@ class RunStore:
         self._write(status, item)
         return item
 
+    @contextmanager
+    def _item_lock(self, item_id: str) -> Iterator[bool]:
+        """Hold the one lock for moving this item; yields False if it could not
+        be had. The lock is a file created with O_EXCL, which is exclusive on
+        every platform. A lock left by a process that died is taken over once
+        it is `_LOCK_STALE_S` old."""
+        self._validate_id(item_id)
+        locks = self.path / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        lock = locks / f"{item_id}.lock"
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        held = False
+        while True:
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                held = True
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > _LOCK_STALE_S:
+                        lock.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass  # released while we looked: try again
+            except PermissionError:
+                pass  # Windows: the name is still being deleted
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        try:
+            yield held
+        finally:
+            if held:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+
     def _move(self, item_id: str, from_status: str, to_status: str, *,
                mutate=None) -> Optional[RunItem]:
-        """The core cross-process-safe primitive: os.rename between status
-        directories. Returns None (never raises) when the source is already
-        gone — that is a lost race, not an error, and callers (claim_next in
-        particular) rely on being able to try the next candidate."""
+        """The core cross-process-safe primitive: move an item between status
+        directories. Returns None (never raises) when the item is no longer in
+        `from_status` -- that is a lost race, not an error, and callers
+        (claim_next in particular) rely on being able to try the next candidate.
+
+        Two things make it safe, and both were learned the hard way
+        (2026-11-10, a second dispatcher beside the solve worker on Windows):
+
+        1. Nothing is written at the OLD path. This used to os.replace() the
+           new content onto `src` and then rename it. os.replace creates its
+           target, so a racer that had read the item just before the winner
+           renamed it put the file BACK in the old directory; its own rename
+           then died on the winner's file (Windows, FileExistsError, uncaught)
+           or replaced it (POSIX, two workers holding one claim). The
+           resurrected copy was claimed and run a second time, and that worker
+           died moving it to done/. Both workers down, one run executed twice.
+
+        2. The rename is not trusted to pick the winner. On Windows a rename
+           acts on an open handle, so two processes that both opened `src`
+           before either renamed it BOTH get success (4 of 120 items with six
+           claimers). The winner is picked by `_item_lock`; the rename then
+           happens under it, once.
+        """
         src = self._file_in(from_status, item_id)
         dst = self._file_in(to_status, item_id)
-        item = self._read(from_status, item_id)
-        if item is None:
+        seen = self._read(from_status, item_id)
+        if seen is None:
             return None
-        if mutate is not None:
-            mutate(item)
-        item.status = to_status
-        item.updated_at = time.time()
-        # Write the NEW content at the OLD path first (still atomic, via
-        # os.replace), then rename into the new directory. Two processes
-        # racing on the same src both attempt this rename; exactly one
-        # succeeds, the other's os.rename raises FileNotFoundError because
-        # the source is gone by the time it gets there.
-        tmp = src.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(item.to_dict(), indent=2), encoding="utf-8")
-        try:
-            os.replace(tmp, src)
-            os.rename(src, dst)
-        except FileNotFoundError:
-            tmp.unlink(missing_ok=True)
-            return None
-        return item
+        with self._item_lock(item_id) as held:
+            if not held:
+                return None
+            try:
+                _when_unshared(os.rename, src, dst)
+            except (FileNotFoundError, FileExistsError):
+                # Gone, or (Windows) already present at the destination: either
+                # way another process moved it first.
+                return None
+            # Ours now. Read it again: an in-place edit (a priority bump) that
+            # landed after the first look is kept, not written over.
+            item = self._read_file(dst) or seen
+            if mutate is not None:
+                mutate(item)
+            item.status = to_status
+            item.updated_at = time.time()
+            tmp = dst.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(item.to_dict(), indent=2), encoding="utf-8")
+            _when_unshared(os.replace, tmp, dst)
+            return item
 
     def claim(self, item_id: str, *, worker_id: str) -> Optional[RunItem]:
         """Attempt to claim a specific queued item. Returns None (not an
