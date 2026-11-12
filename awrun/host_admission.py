@@ -11,6 +11,15 @@ Budget: the defaults below, overridden by ``AWRUN_HOST_BUDGET`` (a JSON object
 with any of the same keys); ``AWRUN_HOST_ADMISSION=off`` disables the check.
 A host without ``/proc/pressure`` (Windows, macOS, an old kernel) cannot be
 judged and is ADMITTED, and the verdict says so.
+
+On a host that has joined a fleet as a placement node (``placement_budget``),
+the memory floor is RAISED to: the node's declared headroom + the memory of the
+services placed there that are not running yet + what the item itself declares
+(``limits.memory_mb``). It is only ever raised: a lower figure is ignored, and
+``AWRUN_HOST_BUDGET`` cannot take the floor below it. On such a node a light
+kind that declares its memory is judged too. Nothing is asked of a controller,
+so a controller outage changes no verdict; local placement state that cannot be
+read reserves nothing and the verdict says the reserve is unknown.
 """
 
 from __future__ import annotations
@@ -19,6 +28,8 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from awrun import placement_budget
 
 #: Kinds that build, render, train or deploy: the ones that can starve a host.
 HEAVY_KINDS = frozenset({"ci", "comet-deploy", "render", "artpack", "solve"})
@@ -76,15 +87,51 @@ def decide(now: Dict[str, float], limits: Dict[str, float]) -> Tuple[bool, str]:
     return True, "within host budget"
 
 
-def admit(kind: str, proc: Path = Path("/proc")) -> Tuple[bool, str, Optional[dict]]:
-    """(run?, why, sample-or-None). Light kinds and unjudgeable hosts are admitted."""
-    if kind not in HEAVY_KINDS:
-        return True, f"{kind} is not a heavy kind", None
+def _declared_gb(memory_mb: object) -> float:
+    """The item's declared memory in GB; 0 when it declared none (or nonsense)."""
+    if isinstance(memory_mb, bool) or not isinstance(memory_mb, (int, float)):
+        return 0.0
+    return memory_mb / 1024.0 if memory_mb > 0 else 0.0
+
+
+def admit(kind: str, proc: Path = Path("/proc"), memory_mb: Optional[float] = None,
+          placement_root: Optional[Path] = None) -> Tuple[bool, str, Optional[dict]]:
+    """(run?, why, sample-or-None). Light kinds and unjudgeable hosts are admitted.
+
+    ``memory_mb`` is what the item declares it needs. It matters only on a host
+    that is a fleet placement node; elsewhere the verdict is what it always was.
+    """
+    heavy = kind in HEAVY_KINDS
+    job_gb = _declared_gb(memory_mb)
+    light = (True, f"{kind} is not a heavy kind", None)
+    if not heavy and job_gb <= 0:
+        return light
     if os.environ.get("AWRUN_HOST_ADMISSION", "").strip().lower() == "off":
+        if not heavy:
+            return light
         return True, "host admission disabled (AWRUN_HOST_ADMISSION=off)", None
+    placed = placement_budget.read(placement_root)
+    if not heavy and placed is None:
+        return light
     try:
         now = sample(proc)
     except (OSError, ValueError, IndexError) as exc:
         return True, f"host pressure unreadable ({exc}) -- admitted unjudged", None
-    ok, why = decide(now, budget())
+    limits = budget()
+    if placed is None:
+        ok, why = decide(now, limits)
+        return ok, why, now
+
+    # A placement node: raise the memory floor, never lower it.
+    floor = placed["headroom_gb"] + placed["pending_gb"] + job_gb
+    raised = floor > limits.get("mem_available_min_gb", 0.0)
+    if raised:
+        limits["mem_available_min_gb"] = floor
+    ok, why = decide(now, limits)
+    if raised and not ok and why.startswith("MemAvailable"):
+        why += (f" (placement floor: headroom {placed['headroom_gb']:.1f} GB"
+                f" + placed units not running {placed['pending_gb']:.1f} GB"
+                f" + this job {job_gb:.1f} GB)")
+    if placed["note"]:
+        why += f" [{placed['note']}]"
     return ok, why, now

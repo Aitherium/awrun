@@ -797,7 +797,14 @@ def dispatch_once(store: RunStore, *, worker_id: str,
     # Asked before the GPU lease so a deferral holds no card. "Not now" is a
     # requeue with backoff, exactly like a lease refusal -- never `failed`.
     if runnable:
-        admitted, why, host_now = host_admission.admit(claimed.kind)
+        # What the item declares it needs counts against a placement node's floor.
+        # An item that declares nothing is asked about exactly as before.
+        declared_mb = (claimed.limits or {}).get("memory_mb")
+        if declared_mb is None:
+            admitted, why, host_now = host_admission.admit(claimed.kind)
+        else:
+            admitted, why, host_now = host_admission.admit(
+                claimed.kind, memory_mb=declared_mb)
         if not admitted:
             delay = _lease_backoff_s(claimed.requeues, None)
             back = store.requeue(claimed.id, now_fn() + delay,
