@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -368,7 +369,40 @@ def _submit_tunnel_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
-_NODE_OP_ACTIONS = ("provision", "recover", "check")
+_NODE_MODEL_ACTIONS = ("provision", "recover", "check")
+#: Fleet membership (2026-11-12): join/leave/read a node on the placement controller.
+#: Executor: services.mesh.awrun_node_op -> lib.mesh.fleet_membership.
+_NODE_FLEET_ACTIONS = ("fleet-join", "fleet-leave", "fleet-status")
+_NODE_OP_ACTIONS = _NODE_MODEL_ACTIONS + _NODE_FLEET_ACTIONS
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_CONTROLLER_RE = re.compile(r"^https://[A-Za-z0-9][A-Za-z0-9.-]{0,252}(?::([0-9]{1,5}))?$")
+
+
+def _check_fleet_spec(spec: dict) -> None:
+    """fleet-* specs: {node, action, controller?, pin_sha256?, force?, dry_run?}."""
+    extra = sorted(set(spec) - {"node", "action", "controller", "pin_sha256", "force",
+                                "dry_run"})
+    if extra:
+        raise RunError(f"--action {spec['action']} takes no {', '.join(extra)}")
+    if "controller" in spec:
+        c = str(spec["controller"] or "").strip().rstrip("/")
+        m = _CONTROLLER_RE.match(c)
+        if not m or not 0 < int(m.group(1) or 443) < 65536:
+            raise RunError(f"--controller must be https://host[:port] (the controller "
+                           f"speaks TLS only), got {spec['controller']!r}")
+        spec["controller"] = c
+    if "pin_sha256" in spec:
+        pin = str(spec["pin_sha256"] or "").strip().lower()
+        pin = pin[len("sha256:"):] if pin.startswith("sha256:") else pin
+        if not _HEX64.match(pin):
+            raise RunError("--pin-sha256 must be 64 hex characters (the controller "
+                           "certificate's SHA-256)")
+        spec["pin_sha256"] = pin
+    for flag in ("force", "dry_run"):
+        if flag in spec and not isinstance(spec[flag], bool):
+            raise RunError(f"{flag} must be true or false, got {spec[flag]!r}")
+    if spec["action"] == "fleet-status" and (spec.get("force") or spec.get("dry_run")):
+        raise RunError("--action fleet-status is a read; --force/--node-dry-run do not apply")
 
 
 def _parse_node_model(raw: str) -> dict:
@@ -408,12 +442,25 @@ def _submit_node_op_spec(args: argparse.Namespace) -> dict:
         spec["headroom_gb"] = args.headroom_gb       # validated below
     if getattr(args, "node_dry_run", False):
         spec["dry_run"] = True
+    if getattr(args, "controller", None):
+        spec["controller"] = args.controller
+    if getattr(args, "pin_sha256", None):
+        spec["pin_sha256"] = args.pin_sha256
+    if getattr(args, "force", False):
+        spec["force"] = True
     node = str(spec.get("node") or "").strip()
     if not node or "/" in node or " " in node:
         raise RunError(f"--node must name a nodes.yaml entry, got {node!r}")
     if spec.get("action") not in _NODE_OP_ACTIONS:
         raise RunError(f"--action must be one of {_NODE_OP_ACTIONS} for --kind node-op, "
                        f"got {spec.get('action')!r}")
+    if spec["action"] in _NODE_FLEET_ACTIONS:
+        _check_fleet_spec(spec)
+        return spec
+    for key in ("controller", "pin_sha256", "force"):
+        if key in spec:
+            raise RunError(f"--{key.replace('_', '-')} applies only to --action "
+                           f"fleet-join|fleet-leave|fleet-status")
     if spec["action"] == "provision" and not spec.get("models"):
         raise RunError("--action provision needs at least one --model name=/path.gguf")
     for m in spec.get("models") or []:
@@ -975,6 +1022,36 @@ def _self_test() -> int:
                 check("a node-op operator's provision reaches the queue",
                       rc8 == 0 and len(queued_n) == 1 and queued_n[0].spec["models"] == [
                           {"name": "qwen", "path": "/m/q.gguf", "pinned": False}])
+
+                # ── node-op fleet membership: the published spec shape ──
+                pin = "ab" * 32
+                join_args = argparse.Namespace(
+                    kind="node-op", priority=0, paths=[], json=False, node="awnix",
+                    action="fleet-join", spec_json=None, headroom_gb=None,
+                    node_dry_run=True, model=None, controller="https://127.0.0.1:8149",
+                    pin_sha256=pin.upper(), force=False)
+                before = len(store.list(statuses=["queued"], kind="node-op"))
+                rc9 = cmd_submit(join_args, store)
+                fleet_q = [i for i in store.list(statuses=["queued"], kind="node-op")
+                           if i.spec.get("action") == "fleet-join"]
+                check("fleet-join queues {node, action, controller, pin_sha256, dry_run}",
+                      rc9 == 0 and len(fleet_q) == 1 and fleet_q[0].spec == {
+                          "node": "awnix", "action": "fleet-join",
+                          "controller": "https://127.0.0.1:8149", "pin_sha256": pin,
+                          "dry_run": True})
+                refusals = [
+                    {"controller": "http://127.0.0.1:8149"},        # plain http
+                    {"controller": "https://h:8149/api"},           # a path
+                    {"pin_sha256": "abc"},                          # short pin
+                    {"action": "fleet-status", "force": True},      # a read + force
+                    {"action": "provision", "model": ["q=/m/q.gguf"]},  # fleet flag
+                ]
+                for over in refusals:
+                    bad_ns = argparse.Namespace(**{**vars(join_args), **over})
+                    check(f"node-op {over} is refused at submit (exit 2)",
+                          cmd_submit(bad_ns, store) == 2)
+                check("no refused fleet spec reached the queue",
+                      len(store.list(statuses=["queued"], kind="node-op")) == before + 1)
             bad = argparse.Namespace(kind="tunnel", priority=0, paths=[], json=False,
                                      action="retire", hostname="demo.example.com",
                                      origin="http://x:1", plane="tunnel")
@@ -1071,7 +1148,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "a JSON object; --service-name/--target override matching keys")
     submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS + _NODE_OP_ACTIONS),
                          help="[kind=tunnel] expose|retire; [kind=node-op] "
-                              "provision|recover|check")
+                              "provision|recover|check|fleet-join|fleet-leave|"
+                              "fleet-status")
     submit.add_argument("--hostname", help="[kind=tunnel] the public FQDN")
     submit.add_argument("--origin", help="[kind=tunnel] scheme://host:port (expose only)")
     submit.add_argument("--plane", choices=list(_TUNNEL_PLANES), default="tunnel",
@@ -1084,6 +1162,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="[kind=node-op] memory kept free (default: nodes.yaml mem_guard)")
     submit.add_argument("--node-dry-run", dest="node_dry_run", action="store_true",
                          help="[kind=node-op] admit/plan only, change nothing on the node")
+    submit.add_argument("--controller",
+                         help="[kind=node-op fleet-join] placement controller URL the node "
+                              "dials, https only (default https://127.0.0.1:8149)")
+    submit.add_argument("--pin-sha256", dest="pin_sha256",
+                         help="[kind=node-op fleet-*] SHA-256 of the controller certificate "
+                              "(64 hex); default $AITHER_PLACEMENT_CONTROLLER_SHA256, else "
+                              "the CA-verified certificate's own")
+    submit.add_argument("--force", action="store_true",
+                         help="[kind=node-op] fleet-join: re-join an approved node; "
+                              "fleet-leave: revoke although units are still placed")
 
     submit.add_argument("--experiment", help="[kind=lab-run] registered experiment name")
     submit.add_argument("--budget-cap-usd", dest="budget_cap_usd", type=float,

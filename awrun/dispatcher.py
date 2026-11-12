@@ -31,6 +31,10 @@ Ten kinds, ten handlers, one dispatch loop:
   "headroom_gb"?, "dry_run"?}`. Submit is authz-gated (`awrun:submit:node-op`): a model
   load that does not fit takes the node's host down. The executor is
   `services.mesh.awrun_node_op` (ssh + memory admission), never awrun.
+  Fleet membership (2026-11-12): `"action": "fleet-join"|"fleet-leave"|"fleet-status"`
+  with `{"node", "controller"?, "pin_sha256"?, "force"?, "dry_run"?}` joins, revokes or
+  reads a node on the placement controller (aither-registry :8149) through
+  `lib.mesh.fleet_membership`; drain with `dev/tools/awrun_node_op_worker.py --once`.
 * `flow`          -- a journaled workflow in a child process. The run id is the
   journal id, so a flow that was suspended (or killed) continues from its journal:
   the calls it already made are replayed, not made again.
@@ -610,7 +614,9 @@ _real_run_render = _host_registered_gap("render", "a media render")
 _real_run_artpack = _host_registered_gap("artpack", "a character art pack bake")
 _real_run_solve = _host_registered_gap("solve", "a problem-solving session")
 _real_run_tunnel = _host_registered_gap("tunnel", "opening or retiring a public hostname")
-_real_run_node_op = _host_registered_gap("node-op", "provisioning or recovering a mesh node")
+_real_run_node_op = _host_registered_gap(
+    "node-op", "provisioning, recovering or joining/leaving a mesh node; worker: "
+    "AitherOS/dev/tools/awrun_node_op_worker.py")
 _real_run_blender_frame = _host_registered_gap("blender-frame", "a Blender frame range")
 
 
