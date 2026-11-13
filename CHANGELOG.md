@@ -4,6 +4,10 @@ All notable changes to `awrun` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **awrun**: `node-op` takes `--action secret-status` and `secret-sync` (spec keys `slots`, `roll`, `dry_run`). They read which fleet secret pair a mesh node holds, or have the host worker write the store's pair into the node's declared env files. A spec never carries a value, and a spec that tries to is refused at submit.
+
 ### Fixed
 
 - **awrun**: several workers on one queue no longer crash, or run an item twice, when they race for it. The store wrote an item's new content at its old path before renaming it, which put the file back in the old directory for the loser of the race; on Windows the loser then died on `FileExistsError` (and the worker that picked up the copy died finishing it), on POSIX it took over the winner's claim. Nothing is written at the old path now, and each move takes a per-item lock (`locks/<id>.lock`, created with `O_EXCL`), because a Windows rename reports success to both racers. A rename refused on Windows while another process has the file open is retried for under a second instead of killing the worker.

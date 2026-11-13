@@ -373,7 +373,10 @@ _NODE_MODEL_ACTIONS = ("provision", "recover", "check")
 #: Fleet membership (2026-11-12): join/leave/read a node on the placement controller.
 #: Executor: services.mesh.awrun_node_op -> lib.mesh.fleet_membership.
 _NODE_FLEET_ACTIONS = ("fleet-join", "fleet-leave", "fleet-status")
-_NODE_OP_ACTIONS = _NODE_MODEL_ACTIONS + _NODE_FLEET_ACTIONS
+#: The fleet secret pair (2026-11-12): read which pair a node holds, or write the
+#: store's pair into its declared carriers. Executor: lib.mesh.secret_sync.
+_NODE_SECRET_ACTIONS = ("secret-status", "secret-sync")
+_NODE_OP_ACTIONS = _NODE_MODEL_ACTIONS + _NODE_FLEET_ACTIONS + _NODE_SECRET_ACTIONS
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _CONTROLLER_RE = re.compile(r"^https://[A-Za-z0-9][A-Za-z0-9.-]{0,252}(?::([0-9]{1,5}))?$")
 
@@ -403,6 +406,22 @@ def _check_fleet_spec(spec: dict) -> None:
             raise RunError(f"{flag} must be true or false, got {spec[flag]!r}")
     if spec["action"] == "fleet-status" and (spec.get("force") or spec.get("dry_run")):
         raise RunError("--action fleet-status is a read; --force/--node-dry-run do not apply")
+
+
+def _check_secret_spec(spec: dict) -> None:
+    """secret-* specs: {node, action, slots?, roll?, dry_run?}. A value is never part
+    of a spec: the worker reads the pair from the store."""
+    extra = sorted(set(spec) - {"node", "action", "slots", "roll", "dry_run"})
+    if extra:
+        raise RunError(f"--action {spec['action']} takes no {', '.join(extra)}")
+    if "slots" in spec and spec["slots"] not in ("previous", "pair"):
+        raise RunError(f"slots must be 'previous' or 'pair', got {spec['slots']!r}")
+    for flag in ("roll", "dry_run"):
+        if flag in spec and not isinstance(spec[flag], bool):
+            raise RunError(f"{flag} must be true or false, got {spec[flag]!r}")
+    if spec["action"] == "secret-status" and (
+            spec.get("slots") or spec.get("roll") or spec.get("dry_run")):
+        raise RunError("--action secret-status is a read; slots/roll/dry_run do not apply")
 
 
 def _parse_node_model(raw: str) -> dict:
@@ -456,6 +475,9 @@ def _submit_node_op_spec(args: argparse.Namespace) -> dict:
                        f"got {spec.get('action')!r}")
     if spec["action"] in _NODE_FLEET_ACTIONS:
         _check_fleet_spec(spec)
+        return spec
+    if spec["action"] in _NODE_SECRET_ACTIONS:
+        _check_secret_spec(spec)
         return spec
     for key in ("controller", "pin_sha256", "force"):
         if key in spec:
