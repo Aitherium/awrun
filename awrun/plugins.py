@@ -74,7 +74,11 @@ def get(name: str) -> Callable[..., Any] | None:
 
 def clear() -> None:
     """Drop every hook. For tests, so one case cannot leak into the next."""
+    global PROVISION_IMPORT_ERROR
     _HOOKS.clear()
+    # The recorded load failure is state too: left set, one test's failed load
+    # read as the next test's failure (the suite was red on main, alone green).
+    PROVISION_IMPORT_ERROR = None
 
 
 def call(name: str, *a: Any, **kw: Any):
