@@ -53,7 +53,11 @@ SYSTEM = (
     '  {"tool": "read_file", "args": {"path": "<file>", "start": 1, "lines": 80}}\n'
     '  {"tool": "grep", "args": {"pattern": "<regex>", "path": "<dir or file>"}}\n'
     '  {"final": "<your answer>"}\n'
-    "Look before you answer. Answer briefly and exactly what was asked."
+    "Paths are relative to the repository root, for example `pyproject.toml` or "
+    "`src/app.py`; never start one with `/`.\n"
+    "Look before you answer, and answer ONLY from what a tool returned: if a tool "
+    "returned an error, fix the call and try again instead of guessing.\n"
+    "Answer briefly and exactly what was asked."
 )
 MAX_OBS = 4000          # characters of tool output fed back per step
 GREP_HITS = 40
@@ -179,8 +183,12 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
     t0 = time.time()
     steps: List[Dict[str, Any]] = []
     totals = {"tokens_in": 0.0, "tokens_out": 0.0, "gen_s": 0.0, "prompt_s": 0.0}
+    # The root listing is given up front: on the first real run a 2B model asked for
+    # `/path/to/pyproject.toml`, got an error and answered from imagination.
+    listing = run_tool(root, "list_dir", {"path": "."})
     msgs = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": f"Task: {task['goal']}"}]
+            {"role": "user", "content": f"Task: {task['goal']}\n\nThe repository root "
+                                        f"contains:\n{listing[:1500]}"}]
     answer: Optional[str] = None
     budget = int(task.get("max_steps", 12))
     for n in range(1, budget + 1):
@@ -194,6 +202,14 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
             obs = ('error: reply was not one JSON object. '
                    'Reply with {"tool": ...} or {"final": ...}.')
             steps.append({"n": n, "kind": "unparsed"})
+        elif "final" in act and act["final"] in (None, "", [], {}):
+            # An empty answer is not an answer; say so and let the model try again.
+            obs = 'error: "final" was empty. Put your full answer in it as a string.'
+            steps.append({"n": n, "kind": "empty_final"})
+        elif "final" not in act and not act.get("tool"):
+            obs = ('error: the object had neither "tool" nor "final". To answer, reply '
+                   '{"final": "<your whole answer as one string>"}.')
+            steps.append({"n": n, "kind": "no_action"})
         elif "final" in act:
             answer = act["final"] if isinstance(act["final"], str) else json.dumps(act["final"])
             steps.append({"n": n, "kind": "final"})
@@ -454,6 +470,19 @@ def self_test() -> int:
                  lambda m: '{"tool": "list_dir", "args": {}}', root, log=lambda s: None)
     if loop["verdict"] != "BUDGET_EXHAUSTED" or loop["steps"] != 3:
         fails.append("budget was not enforced")
+    seen: List[str] = []
+    retry = iter(['{"final": null}', '{"number": 1, "summary": "x"}', '{"final": "done"}'])
+
+    def _chat(m: List[Dict[str, str]]) -> str:
+        seen.append(m[-1]["content"])
+        return next(retry)
+
+    again = solve({"id": "t4", "goal": "x"}, _chat, root, log=lambda s: None)
+    if again["answer"] != "done" or [t["kind"] for t in again["trace"]] != [
+            "empty_final", "no_action", "final"]:
+        fails.append(f"an empty or shapeless reply was taken as the answer: {again}")
+    if "cfg.yaml" not in seen[0]:
+        fails.append("the first message does not show the repository root")
     if "escapes" not in run_tool(root, "read_file", {"path": "../../etc/passwd"}):
         fails.append("a path outside the root was readable")
     parts = []
