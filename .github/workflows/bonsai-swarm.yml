@@ -169,6 +169,18 @@ jobs:
             --require-owner --allow-owner "$OWNER" --max-tokens 2048 \
             --out "result-$TASK_ID.json" || true
           test -s "result-$TASK_ID.json"
+      - name: Runner facts (throwaway diagnostic branch, not on main)
+        if: always()
+        run: |
+          echo "== cpu"; nproc; lscpu | grep -E "Model name|Thread|Core|Socket" || true
+          echo "== memory (GiB)"; free -g
+          echo "== disk"; df -h / "$HOME" "$RUNNER_TEMP" | sort -u
+          echo "== model file"; ls -l "$HOME/models/"
+          echo "== llama-server RSS (kB) and peak (VmHWM)"
+          PID=$(pgrep -f llama-server | head -1 || true)
+          [ -n "$PID" ] && grep -E "VmRSS|VmHWM|VmPeak" "/proc/$PID/status" || echo "no server process"
+          echo "== server log"
+          grep -iE "system_info|n_threads|model size|load time|file size|n_ctx|eval time" "$RUNNER_TEMP/llama.log" | tail -30 || true
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
