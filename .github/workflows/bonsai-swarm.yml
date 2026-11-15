@@ -35,11 +35,13 @@ on:
       tasks_json: {description: "task list as JSON (see awrun/swarm.py)", required: true, type: string}
       model_size: {description: "Bonsai 2 size: 2B | 4B | 9B", required: false, default: "4B", type: string}
       awrun_id: {description: "caller's run id; shown in the run name so the caller can find this run", required: false, default: "", type: string}
+      mode: {description: "swarm (default) | image-bench (measure CPU image generation, no tasks run)", required: false, default: "swarm", type: string}
   workflow_call:
     inputs:
       tasks_json: {required: true, type: string}
       model_size: {required: false, default: "4B", type: string}
       awrun_id: {required: false, default: "", type: string}
+      mode: {required: false, default: "swarm", type: string}
 permissions:
   contents: read
 env:
@@ -50,6 +52,7 @@ env:
   SWARM_REF: ${{ github.repository == 'Aitherium/awrun' && github.ref || 'main' }}
 jobs:
   plan:
+    if: inputs.mode != 'image-bench'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -219,3 +222,53 @@ jobs:
           path: |
             swarm-report.json
             swarm-report.md
+  # mode=image-bench: is CPU image generation usable on ONE free hosted runner?
+  # One job per engine; each loads its model once and records seconds per image at
+  # 320 and 512 px plus peak RSS into the `image-bench-<engine>` artifact (JSON +
+  # the PNGs). A failure is recorded as a failure, never as a number.
+  image-bench:
+    if: inputs.mode == 'image-bench'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [openvino-sd-turbo, sdcpp, sana-sprint]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with: {python-version: "3.12"}
+      - name: Machine
+        run: nproc && free -m && lscpu | grep -E "Model name|Flags" | cut -c1-200
+      - name: Install (diffusers engines)
+        if: matrix.engine != 'sdcpp'
+        run: |
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          if [ "${{ matrix.engine }}" = "openvino-sd-turbo" ]; then
+            pip install --quiet "optimum[openvino]" diffusers transformers
+          else
+            pip install --quiet diffusers transformers accelerate sentencepiece
+          fi
+      - name: Install (stable-diffusion.cpp + sd-turbo)
+        if: matrix.engine == 'sdcpp'
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          url=$(gh api repos/leejet/stable-diffusion.cpp/releases/latest --jq '.assets[] | select(.name | test("Linux.*x86_64|linux.*x64"; "i")) | select(.name | test("avx2|noavx|cuda|vulkan"; "i") | not) | .browser_download_url' | head -1)
+          [ -n "$url" ] || url=$(gh api repos/leejet/stable-diffusion.cpp/releases/latest --jq '.assets[] | select(.name | test("Linux"; "i")) | select(.name | test("cuda|vulkan|rocm"; "i") | not) | .browser_download_url' | head -1)
+          echo "sd.cpp asset: $url"
+          curl -fsSL -o sd.zip "$url" && mkdir -p sdbin && unzip -q sd.zip -d sdbin
+          SD=$(find sdbin -type f -name sd -perm -u+x | head -1); [ -n "$SD" ] || SD=$(find sdbin -type f -name 'sd*' | head -1)
+          chmod +x "$SD"; echo "SD_BIN=$PWD/$SD" >> "$GITHUB_ENV"
+          curl -fsSL -o sd_turbo.safetensors https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors
+          ls -la sd_turbo.safetensors
+      - name: Bench
+        run: |
+          /usr/bin/time -v python scripts/image_cpu_bench.py ${{ matrix.engine }} bench-out             --sd-bin "${SD_BIN:-}" --model "$PWD/sd_turbo.safetensors" 2> bench-out-time.txt || echo "bench exited $?"
+          grep -E "Maximum resident|Elapsed" bench-out-time.txt || true
+          mkdir -p bench-out && cp bench-out-time.txt bench-out/ || true
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-bench-${{ matrix.engine }}
+          path: bench-out
+          if-no-files-found: warn
