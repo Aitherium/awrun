@@ -82,8 +82,9 @@ def run_tool(root: Path, name: str, args: Dict[str, Any]) -> str:
     try:
         if name == "list_dir":
             p = _safe(root, args.get("path", "."))
-            names = sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir()
-                           if x.name != ".git")
+            # A symlink is NAMED, never followed: `@` marks it and no tool reads it.
+            names = sorted(x.name + ("@" if x.is_symlink() else "/" if x.is_dir() else "")
+                           for x in p.iterdir() if x.name != ".git")
             return "\n".join(names[:200]) or "(empty)"
         if name == "read_file":
             p = _safe(root, args["path"])
@@ -103,11 +104,13 @@ def run_tool(root: Path, name: str, args: Dict[str, Any]) -> str:
             for f in files:
                 if SKIP_DIRS.intersection(f.relative_to(root).parts):
                     continue
-                if not f.is_file() or f.stat().st_size > 2_000_000:
+                # A symlink committed in the repository can point anywhere on the
+                # runner; skip every one, and anything reached through one.
+                if f.is_symlink() or not f.is_file() or f.stat().st_size > 2_000_000:
                     continue
                 real = f.resolve()
                 if real != root and root not in real.parents:
-                    continue        # a symlink out of the clone is not readable
+                    continue
                 try:
                     for i, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
                         if rx.search(ln):
@@ -479,6 +482,8 @@ def self_test() -> int:
             fails.append("grep read through a symlink that leaves the root")
         if "escapes" not in run_tool(root, "read_file", {"path": "link.txt"}):
             fails.append("read_file followed a symlink that leaves the root")
+        if "link.txt@" not in run_tool(root, "list_dir", {"path": "."}):
+            fails.append("list_dir did not mark a symlink")
         (root / "link.txt").unlink()
     except OSError:
         pass        # this platform cannot make a symlink; nothing to follow either
@@ -515,6 +520,8 @@ def self_test() -> int:
         fails.append(f"issues context is wrong: {issues}")
     if "#5" not in (made / ".swarm" / "merged_pulls.md").read_text(encoding="utf-8"):
         fails.append("merged pull requests were not written")
+    if main(["--list", "x.json", "--require-owner", "--allow-owner", ""]) != 2:
+        fails.append("--require-owner with an empty owner did not stop the run")
     if "MISSING" not in render_report(rep) or "| t1 |" not in render_report(rep):
         fails.append("the rendered report does not name the missing task or the results")
     for f in fails:
@@ -539,6 +546,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--allow-owner", default="",
                     help="the only owner whose repositories a task may name; without "
                          "it every task that names a repository is refused")
+    ap.add_argument("--require-owner", action="store_true",
+                    help="exit 2 when --allow-owner is empty (what a workflow passes: an "
+                         "unset owner must stop the run, not lift the restriction)")
     ap.add_argument("--root", help="the tree the tools may read (default: task.root or cwd)")
     ap.add_argument("--url", default="http://127.0.0.1:8090")
     ap.add_argument("--model", default="bonsai2")
@@ -549,6 +559,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.require_owner and not a.allow_owner.strip():
+        print("could not run: --require-owner is set and --allow-owner is empty",
+              file=sys.stderr)
+        return 2
     try:
         if a.list:
             print(json.dumps([t["id"] for t in load_tasks(a.list, a.allow_owner)]))

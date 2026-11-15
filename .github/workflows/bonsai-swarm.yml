@@ -21,7 +21,8 @@
 # owner this workflow runs under; with no owner named, every repository is refused.
 #
 # The model's output is data: the loop offers three tools (list_dir, read_file, grep),
-# each confined to the clone; there is no shell tool and no tool that takes a URL.
+# each confined to the clone and none following a symlink; there is no shell tool and
+# no tool that takes a URL. A model-written regex can be slow; the job timeout bounds it.
 #
 # The jobs hold no secret and never call back. The caller PULLS the artifact with its own
 # GitHub login. The token in the `Context` step is this run's read-only token, used for
@@ -70,11 +71,12 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          test -n "$OWNER" || { echo "::error::no repository owner; refusing to run"; exit 1; }
           python3 awrun/swarm.py --self-test
           # Passed by env, never interpolated into the script, so a caller's JSON
           # cannot inject shell.
           printf '%s' "$TASKS_JSON" > swarm-tasks.json
-          IDS=$(python3 awrun/swarm.py --list swarm-tasks.json --allow-owner "$OWNER")
+          IDS=$(python3 awrun/swarm.py --list swarm-tasks.json --require-owner --allow-owner "$OWNER")
           case "$MODEL_SIZE" in
             # REV pins the model repository's commit; SHA is the file's sha256.
             2B) REV=a6032a5089ac27e96be3a80c7b42d1ad0bd89887
@@ -125,7 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 awrun/swarm.py --prepare swarm-tasks.json --id "$TASK_ID" \
-            --dest "$RUNNER_TEMP/target" --allow-owner "$OWNER"
+            --dest "$RUNNER_TEMP/target" --require-owner --allow-owner "$OWNER"
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: model
         with:
@@ -164,7 +166,7 @@ jobs:
         run: |
           python3 awrun/swarm.py --task swarm-tasks.json --id "$TASK_ID" \
             --root "$RUNNER_TEMP/target" --url http://127.0.0.1:8090 \
-            --allow-owner "$OWNER" --max-tokens 2048 \
+            --require-owner --allow-owner "$OWNER" --max-tokens 2048 \
             --out "result-$TASK_ID.json" || true
           test -s "result-$TASK_ID.json"
       - if: always()
@@ -204,7 +206,7 @@ jobs:
           mkdir -p results
           shopt -s nullglob
           python3 awrun/swarm.py --combine results/*.json --expect swarm-tasks.json \
-            --allow-owner "$OWNER" \
+            --require-owner --allow-owner "$OWNER" \
             --meta "model=Bonsai 2 $MODEL_SIZE" --meta "run_url=$RUN_URL" \
             --out swarm-report.json --markdown swarm-report.md
           rc=$?
