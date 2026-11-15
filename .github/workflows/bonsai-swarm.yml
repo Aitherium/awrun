@@ -245,20 +245,24 @@ jobs:
         run: |
           pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
           if [ "${{ matrix.engine }}" = "openvino-sd-turbo" ]; then
-            pip install --quiet "optimum[openvino]" diffusers transformers
+            pip install --quiet "optimum-intel[openvino,diffusers]"
+            python -c "from optimum.intel import OVStableDiffusionPipeline; print('ov ok')"
           else
             pip install --quiet diffusers transformers accelerate sentencepiece
           fi
       - name: Install (stable-diffusion.cpp + sd-turbo)
         if: matrix.engine == 'sdcpp'
-        env: {GH_TOKEN: "${{ github.token }}"}
         run: |
-          url=$(gh api repos/leejet/stable-diffusion.cpp/releases/latest --jq '.assets[] | select(.name | test("Linux.*x86_64|linux.*x64"; "i")) | select(.name | test("avx2|noavx|cuda|vulkan"; "i") | not) | .browser_download_url' | head -1)
-          [ -n "$url" ] || url=$(gh api repos/leejet/stable-diffusion.cpp/releases/latest --jq '.assets[] | select(.name | test("Linux"; "i")) | select(.name | test("cuda|vulkan|rocm"; "i") | not) | .browser_download_url' | head -1)
-          echo "sd.cpp asset: $url"
-          curl -fsSL -o sd.zip "$url" && mkdir -p sdbin && unzip -q sd.zip -d sdbin
-          SD=$(find sdbin -type f -name sd -perm -u+x | head -1); [ -n "$SD" ] || SD=$(find sdbin -type f -name 'sd*' | head -1)
-          chmod +x "$SD"; echo "SD_BIN=$PWD/$SD" >> "$GITHUB_ENV"
+          # Built from source: the only Linux CPU release binary targets a newer
+          # Ubuntu than the hosted runner, and the 24.04 one is a ROCm build.
+          git clone --depth 1 --recursive https://github.com/leejet/stable-diffusion.cpp sdsrc
+          cmake -S sdsrc -B sdsrc/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+          cmake --build sdsrc/build --config Release -j "$(nproc)" >/dev/null
+          ls sdsrc/build/bin
+          SD=$(ls sdsrc/build/bin | grep -E '^sd(-cli)?$' | head -1)
+          [ -n "$SD" ] || { echo "no sd cli built"; exit 1; }
+          echo "SD_BIN=$PWD/sdsrc/build/bin/$SD" >> "$GITHUB_ENV"
+          (cd sdsrc && git log -1 --format='sd.cpp %h %cs')
           curl -fsSL -o sd_turbo.safetensors https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors
           ls -la sd_turbo.safetensors
       - name: Bench
