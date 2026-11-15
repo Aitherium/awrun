@@ -36,12 +36,14 @@ on:
       model_size: {description: "Bonsai 2 size: 2B | 4B | 9B", required: false, default: "4B", type: string}
       awrun_id: {description: "caller's run id; shown in the run name so the caller can find this run", required: false, default: "", type: string}
       mode: {description: "swarm (default) | image-bench (measure CPU image generation, no tasks run)", required: false, default: "swarm", type: string}
+      bench_engines: {description: "image-bench only: JSON list of engines", required: false, default: '["openvino-sd-turbo","sdcpp","sana-sprint"]', type: string}
   workflow_call:
     inputs:
       tasks_json: {required: true, type: string}
       model_size: {required: false, default: "4B", type: string}
       awrun_id: {required: false, default: "", type: string}
       mode: {required: false, default: "swarm", type: string}
+      bench_engines: {required: false, default: '["openvino-sd-turbo","sdcpp","sana-sprint"]', type: string}
 permissions:
   contents: read
 env:
@@ -233,7 +235,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [openvino-sd-turbo, sdcpp, sana-sprint]
+        engine: ${{ fromJSON(inputs.bench_engines) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -243,9 +245,9 @@ jobs:
       - name: Install (diffusers engines)
         if: matrix.engine != 'sdcpp'
         run: |
-          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch torchvision
           if [ "${{ matrix.engine }}" = "openvino-sd-turbo" ]; then
-            pip install --quiet "optimum-intel[openvino,diffusers]"
+            pip install --quiet --extra-index-url https://download.pytorch.org/whl/cpu "optimum-intel[openvino,diffusers]"
             python -c "from optimum.intel import OVStableDiffusionPipeline; print('ov ok')"
           else
             pip install --quiet diffusers transformers accelerate sentencepiece
