@@ -1,0 +1,221 @@
+# One hosted runner per narrowly scoped task. Each job clones ONE public repository,
+# starts a small Bonsai 2 model on the runner's CPU (llama.cpp, the PrismML fork: stock
+# llama.cpp loads these files and answers gibberish) and runs awrun/swarm.py against it:
+# read-only file tools, a step budget, one answer. `combine` merges every answer into the
+# `swarm-report` artifact.
+#
+# Start it from a machine that has awrun:
+#   awrun swarm submit tasks.json --size 4B --run      # dispatch, wait, collect
+#   awrun swarm result <id>                            # read the report again later
+# or call it from another workflow:
+#   jobs:
+#     swarm:
+#       uses: Aitherium/awrun/.github/workflows/bonsai-swarm.yml@main
+#       with:
+#         tasks_json: ${{ vars.SWARM_TASKS }}
+#         model_size: 4B
+#
+# Bounds: at most 32 tasks per run (one job each, 45 minutes per job), at most 20 model
+# turns per task and 2048 tokens per turn; awrun/swarm.py refuses a list beyond them in
+# the `plan` job, before any task job starts. A task may only name a repository of the
+# owner this workflow runs under; with no owner named, every repository is refused.
+#
+# The model's output is data: the loop offers three tools (list_dir, read_file, grep),
+# each confined to the clone and none following a symlink; there is no shell tool and
+# no tool that takes a URL. A model-written regex can be slow; the job timeout bounds it.
+#
+# The jobs hold no secret and never call back. The caller PULLS the artifact with its own
+# GitHub login. The token in the `Context` step is this run's read-only token, used for
+# public API reads, and is not present in the step where the model runs.
+name: bonsai-swarm
+run-name: bonsai-swarm ${{ inputs.awrun_id }} (${{ inputs.model_size }})
+on:
+  workflow_dispatch:
+    inputs:
+      tasks_json: {description: "task list as JSON (see awrun/swarm.py)", required: true, type: string}
+      model_size: {description: "Bonsai 2 size: 2B | 4B | 9B", required: false, default: "4B", type: string}
+      awrun_id: {description: "caller's run id; shown in the run name so the caller can find this run", required: false, default: "", type: string}
+  workflow_call:
+    inputs:
+      tasks_json: {required: true, type: string}
+      model_size: {required: false, default: "4B", type: string}
+      awrun_id: {required: false, default: "", type: string}
+permissions:
+  contents: read
+env:
+  LLAMA_URL: https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b12128-d7b2896/llama-prism-b12128-d7b2896-bin-ubuntu-x64.tar.gz
+  LLAMA_SHA256: 67bdd24e458715fd2fbb128297c44f480b3b4bbea254adf5e571feb3e82c5f53
+  # A workflow dispatched on a branch of this repository tests that branch's loop; a
+  # caller in another repository gets main.
+  SWARM_REF: ${{ github.repository == 'Aitherium/awrun' && github.ref || 'main' }}
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ids: ${{ steps.list.outputs.ids }}
+      sha: ${{ steps.list.outputs.sha }}
+      rev: ${{ steps.list.outputs.rev }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Aitherium/awrun
+          ref: ${{ env.SWARM_REF }}
+          persist-credentials: false
+          sparse-checkout: awrun/swarm.py
+          sparse-checkout-cone-mode: false
+      - id: list
+        env:
+          TASKS_JSON: ${{ inputs.tasks_json }}
+          MODEL_SIZE: ${{ inputs.model_size }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          test -n "$OWNER" || { echo "::error::no repository owner; refusing to run"; exit 1; }
+          python3 awrun/swarm.py --self-test
+          # Passed by env, never interpolated into the script, so a caller's JSON
+          # cannot inject shell.
+          printf '%s' "$TASKS_JSON" > swarm-tasks.json
+          IDS=$(python3 awrun/swarm.py --list swarm-tasks.json --require-owner --allow-owner "$OWNER")
+          case "$MODEL_SIZE" in
+            # REV pins the model repository's commit; SHA is the file's sha256.
+            2B) REV=a6032a5089ac27e96be3a80c7b42d1ad0bd89887
+                SHA=36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa ;;
+            4B) REV=50ebba61be85e5be07e8083db468ace0fc1bac43
+                SHA=56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60 ;;
+            9B) REV=82265ccc78ddaac4700286a35e9badcc32376dd9
+                SHA=3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b ;;
+            *) echo "::error::model_size must be 2B, 4B or 9B"; exit 1 ;;
+          esac
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "rev=$REV" >> "$GITHUB_OUTPUT"
+          echo "tasks: $IDS"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swarm-tasks
+          path: swarm-tasks.json
+  task:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        id: ${{ fromJSON(needs.plan.outputs.ids) }}
+    env:
+      MODEL_SIZE: ${{ inputs.model_size }}
+      MODEL_SHA: ${{ needs.plan.outputs.sha }}
+      MODEL_REV: ${{ needs.plan.outputs.rev }}
+      TASK_ID: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Aitherium/awrun
+          ref: ${{ env.SWARM_REF }}
+          persist-credentials: false
+          sparse-checkout: awrun/swarm.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: swarm-tasks
+      - name: Context (clone the task's repository, fetch what it asked for)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          python3 awrun/swarm.py --prepare swarm-tasks.json --id "$TASK_ID" \
+            --dest "$RUNNER_TEMP/target" --require-owner --allow-owner "$OWNER"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: model
+        with:
+          path: ~/models
+          key: bonsai2-${{ inputs.model_size }}-${{ needs.plan.outputs.sha }}
+      - name: Model
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/models
+          curl -fsSL --retry 3 -o ~/models/m.gguf \
+            "https://huggingface.co/prism-ml/Ternary-Bonsai-2-$MODEL_SIZE-gguf/resolve/$MODEL_REV/Ternary-Bonsai-2-$MODEL_SIZE-PTQ1_0.gguf"
+      - name: Serve (model and runtime sha256-verified)
+        run: |
+          set -euo pipefail
+          echo "$MODEL_SHA  $HOME/models/m.gguf" | sha256sum -c -
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/llama.tar.gz" "$LLAMA_URL"
+          echo "$LLAMA_SHA256  $RUNNER_TEMP/llama.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/llama"
+          tar -xzf "$RUNNER_TEMP/llama.tar.gz" -C "$RUNNER_TEMP/llama"
+          BIN=$(find "$RUNNER_TEMP/llama" -type f -name llama-server | head -1)
+          test -n "$BIN" || { echo "::error::no llama-server in the release archive"; exit 1; }
+          chmod +x "$BIN"
+          export LD_LIBRARY_PATH="$(dirname "$BIN"):${LD_LIBRARY_PATH:-}"
+          nohup "$BIN" -m "$HOME/models/m.gguf" --alias bonsai2 --host 127.0.0.1 --port 8090 \
+            -c 16384 -np 1 -t "$(nproc)" --no-webui --jinja --reasoning-budget 1024 \
+            > "$RUNNER_TEMP/llama.log" 2>&1 &
+          for i in $(seq 1 60); do curl -fs 127.0.0.1:8090/health >/dev/null && break; sleep 5; done
+          curl -fs 127.0.0.1:8090/health || { tail -40 "$RUNNER_TEMP/llama.log"; exit 1; }
+      - name: Solve ${{ matrix.id }}
+        # always(): if the model never came up, the loop still writes an ERROR result,
+        # so the report names this task instead of losing it.
+        if: always()
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 awrun/swarm.py --task swarm-tasks.json --id "$TASK_ID" \
+            --root "$RUNNER_TEMP/target" --url http://127.0.0.1:8090 \
+            --require-owner --allow-owner "$OWNER" --max-tokens 2048 \
+            --out "result-$TASK_ID.json" || true
+          test -s "result-$TASK_ID.json"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: result-${{ matrix.id }}
+          path: result-${{ matrix.id }}.json
+          if-no-files-found: warn
+  combine:
+    needs: [plan, task]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Aitherium/awrun
+          ref: ${{ env.SWARM_REF }}
+          persist-credentials: false
+          sparse-checkout: awrun/swarm.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: swarm-tasks
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: Combine
+        env:
+          MODEL_SIZE: ${{ inputs.model_size }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          shopt -s nullglob
+          python3 awrun/swarm.py --combine results/*.json --expect swarm-tasks.json \
+            --require-owner --allow-owner "$OWNER" \
+            --meta "model=Bonsai 2 $MODEL_SIZE" --meta "run_url=$RUN_URL" \
+            --out swarm-report.json --markdown swarm-report.md
+          rc=$?
+          [ -f swarm-report.md ] && cat swarm-report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swarm-report
+          path: |
+            swarm-report.json
+            swarm-report.md
