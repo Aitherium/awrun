@@ -30,6 +30,17 @@ reply is ONE JSON object, either {"tool": "<name>", "args": {...}} or
 {"final": "<answer>"}. A reply that is not parseable JSON costs a step and is answered
 with the error, never silently skipped.
 
+Verdicts. PASS / FAIL: the answer was graded by the task's `check`. ANSWERED: an answer
+with no check; nobody has verified it. UNGROUNDED: the model answered without one
+successful tool call, so the answer was not read from the repository and is not graded.
+BUDGET_EXHAUSTED: no usable answer inside the step budget (an empty, null or non-string
+`final` is not an answer). ERROR: the model server failed. Everything except PASS and
+ANSWERED is a failure in the report.
+
+A `check` must pin the expected value. One that also matches a placeholder ("0.0.0",
+"1.2.3", "unknown", ...) is refused: on the first real run a version-shaped regex graded
+an invented "1.0.0" as PASS. Read the true value before dispatch and write it in.
+
 Exit: 0 done, 1 a task is missing from the report / budget exhausted, 2 could not run.
 """
 from __future__ import annotations
@@ -65,6 +76,11 @@ MAX_INLINE = 60_000     # a workflow_dispatch input is capped near 65 KB
 MAX_TASKS = 32          # one job each: the cap on what a single dispatch can start
 MAX_STEPS = 20          # model turns per task
 MAX_TOKENS = 2048       # tokens the model may write per turn
+FAILURES = frozenset({"FAIL", "UNGROUNDED", "BUDGET_EXHAUSTED", "ERROR"})
+#: Strings a model writes when it has not looked. A check that accepts one of
+#: them grades a guess as PASS, so such a check is refused.
+DECOYS = ("0.0.0", "1.2.3", "9.9.9", "x.y.z", "unknown", "none", "null",
+          "n/a", "yes", "no", "")
 FETCHABLE = ("issues", "pulls")
 SIZES = ("2B", "4B", "9B")
 REPO_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$")
@@ -81,9 +97,30 @@ def _safe(root: Path, rel: str) -> Path:
     return p
 
 
+def _path_hint(root: Path, rel: Any) -> Optional[str]:
+    """An error that names the right form, for a path a small model tends to invent:
+    absolute (`/path/to/x`) or a template (`<file>`). None when the path looks usable."""
+    text = str(rel or "")
+    if not (text.startswith("/") or "path/to" in text or "<" in text or ">" in text):
+        return None
+    name = text.replace(chr(92), "/").rstrip("/").rsplit("/", 1)[-1].strip("<>")
+    stripped = text.lstrip("/")
+    for guess in (stripped, name):
+        if guess and "<" not in guess and (root / guess).exists():
+            return (f'error: {text!r} is not a path in this repository. Paths are relative '
+                    f'to the repository root: use "{guess}".')
+    return (f'error: {text!r} is not a path in this repository. Paths are relative to the '
+            'repository root, like "README.md". Call list_dir with path "." to see what '
+            'exists.')
+
+
 def run_tool(root: Path, name: str, args: Dict[str, Any]) -> str:
     """Execute one read-only tool. Errors come back as text for the model to read."""
     try:
+        if name in ("list_dir", "read_file", "grep") and "path" in args:
+            hint = _path_hint(root, args.get("path"))
+            if hint:
+                return hint
         if name == "list_dir":
             p = _safe(root, args.get("path", "."))
             # A symlink is NAMED, never followed: `@` marks it and no tool reads it.
@@ -190,6 +227,7 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
             {"role": "user", "content": f"Task: {task['goal']}\n\nThe repository root "
                                         f"contains:\n{listing[:1500]}"}]
     answer: Optional[str] = None
+    grounded = 0            # tool calls that returned something other than an error
     budget = int(task.get("max_steps", 12))
     for n in range(1, budget + 1):
         got = chat(msgs)
@@ -202,16 +240,18 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
             obs = ('error: reply was not one JSON object. '
                    'Reply with {"tool": ...} or {"final": ...}.')
             steps.append({"n": n, "kind": "unparsed"})
-        elif "final" in act and act["final"] in (None, "", [], {}):
-            # An empty answer is not an answer; say so and let the model try again.
-            obs = 'error: "final" was empty. Put your full answer in it as a string.'
+        elif "final" in act and (not isinstance(act["final"], str)
+                                 or act["final"].strip().lower() in ("", "null", "none")):
+            # Empty, null or not a string: not an answer. Say so; the model may retry.
+            obs = ('error: "final" must be a non-empty string holding your whole answer '
+                   '(a table goes inside the string).')
             steps.append({"n": n, "kind": "empty_final"})
         elif "final" not in act and not act.get("tool"):
             obs = ('error: the object had neither "tool" nor "final". To answer, reply '
                    '{"final": "<your whole answer as one string>"}.')
             steps.append({"n": n, "kind": "no_action"})
         elif "final" in act:
-            answer = act["final"] if isinstance(act["final"], str) else json.dumps(act["final"])
+            answer = act["final"]
             steps.append({"n": n, "kind": "final"})
             log(f"[progress] {task['id']} step {n}/{budget} final")
             break
@@ -219,13 +259,18 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
             name = str(act.get("tool", ""))
             args = act.get("args") if isinstance(act.get("args"), dict) else {}
             obs = run_tool(root, name, args)
-            steps.append({"n": n, "kind": "tool", "tool": name, "args": args})
+            ok = not obs.startswith("error:")
+            grounded += 1 if ok else 0
+            steps.append({"n": n, "kind": "tool", "tool": name, "args": args, "ok": ok})
         what = steps[-1].get("tool") or steps[-1]["kind"]
         log(f"[progress] {task['id']} step {n}/{budget} {what}")
         msgs.append({"role": "user", "content": "Observation:\n" + obs[:MAX_OBS]})
     check = task.get("check")
     if answer is None:
         verdict = "BUDGET_EXHAUSTED"
+    elif grounded == 0:
+        # Answered without reading anything: whatever it says, it was not looked up.
+        verdict = "UNGROUNDED"
     elif check:
         verdict = "PASS" if re.search(check, answer, flags=re.I | re.S) else "FAIL"
     else:
@@ -233,7 +278,7 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
     tok_s = round(totals["tokens_out"] / totals["gen_s"], 2) if totals["gen_s"] > 0 else None
     return {"id": task["id"], "goal": task["goal"], "repo": task.get("repo"),
             "answer": answer, "verdict": verdict, "check": check, "steps": len(steps),
-            "trace": steps, "wall_s": round(time.time() - t0, 1),
+            "tool_calls_ok": grounded, "trace": steps, "wall_s": round(time.time() - t0, 1),
             "tokens_in": int(totals["tokens_in"]), "tokens_out": int(totals["tokens_out"]),
             "gen_s": round(totals["gen_s"], 1), "tok_per_s": tok_s,
             "runner": os.environ.get("RUNNER_NAME") or None}
@@ -296,9 +341,15 @@ def validate_tasks(doc: Any, allow_owner: str = "") -> List[Dict[str, Any]]:
                              f"{[hex(ord(c)) for c in bad]} -- under-escaped regex? "
                              "JSON needs \\\\b for a word boundary")
         try:
-            re.compile(check)
+            rx = re.compile(check, flags=re.I | re.S)
         except re.error as exc:
             raise ValueError(f"task {tid}: check is not a valid regex: {exc}") from exc
+        if check:
+            loose = next((d for d in DECOYS if rx.search(d)), None)
+            if loose is not None:
+                raise ValueError(f"task {tid}: check is too loose, it accepts the "
+                                 f"placeholder {loose!r}. Pin the expected value (read it "
+                                 "before dispatch), or drop the check.")
     return tasks
 
 
@@ -313,6 +364,61 @@ def inline(tasks: List[Dict[str, Any]]) -> str:
         raise ValueError(f"task list is {len(body)} characters; a workflow input holds "
                          f"about {MAX_INLINE}. Split the swarm.")
     return body
+
+
+# ── the boundary: what may leave this machine for a shared runner ───────────
+
+#: A hosted runner is shared with strangers and its logs are public, so a task list
+#: may carry nothing a stranger must not read. These are the generic classes; a host
+#: adds its own (internal names, ticket ids) with `extra` patterns.
+_BOUNDARY = (
+    ("api-key", r"\b(sk|pk|rk)[-_](live|test|ant|proj)?[-_]?[A-Za-z0-9]{20,}"),
+    ("github-token", r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    ("cloud-key", r"\bAKIA[0-9A-Z]{16}\b"),
+    ("chat-token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    ("private-key", "-----BEGIN" + r" [A-Z ]*PRIVATE KEY"),
+    ("bearer", r"(?i)\b(bearer|authorization:)\s+[A-Za-z0-9._~+/-]{20,}"),
+    ("windows-path", r"\b[A-Za-z]:[\\/][A-Za-z0-9_.-]"),
+    ("home-path", r"(?<![\w.])/(home|root|Users|mnt|opt/[a-z])[/\w]"),
+    ("private-address", r"\b(10|127|192\.168|172\.(1[6-9]|2\d|3[01]))\.\d+\.\d+"
+                        r"(\.\d+)?\b"),
+)
+
+
+def boundary_hits(tasks: List[Dict[str, Any]],
+                  extra: Optional[List[Tuple[str, str]]] = None) -> List[str]:
+    """Why this task list may NOT be sent to a shared runner: one line per finding,
+    naming the task and the class, never echoing the matched text (it may be the
+    secret). Empty = it may go. The caller REFUSES on any hit; nothing is redacted
+    and sent anyway, because a scrubbed payload still ran."""
+    rules = [(n, re.compile(rx)) for n, rx in list(_BOUNDARY) + list(extra or [])]
+    out: List[str] = []
+    for t in tasks:
+        # The values themselves, not their JSON spelling: JSON doubles a backslash.
+        text = " ".join(str(v) for v in t.values())
+        for name, rx in rules:
+            if rx.search(text):
+                out.append(f"task {t.get('id')}: carries a {name}")
+    return out
+
+
+def load_patterns(path: str) -> List[Tuple[str, str]]:
+    """Extra boundary patterns from a file: `name<TAB or spaces>regex` per line,
+    `#` comments. A pattern that does not compile is an error, never skipped."""
+    out: List[Tuple[str, str]] = []
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            raise ValueError(f"{path}:{n}: want `name regex`")
+        try:
+            re.compile(parts[1])
+        except re.error as exc:
+            raise ValueError(f"{path}:{n}: {exc}") from exc
+        out.append((parts[0], parts[1]))
+    return out
 
 
 # ── the task's context (runs on the job, before the model starts) ───────────
@@ -409,7 +515,9 @@ def combine(paths: List[str], expect: Optional[List[str]] = None,
     rates = [r["tok_per_s"] for r in rows if r.get("tok_per_s")]
     missing = sorted(set(expect or []) - seen)
     report: Dict[str, Any] = {
-        "tasks": len(rows), "missing": missing, "verdicts": counts, "graded": len(graded),
+        "tasks": len(rows), "missing": missing, "verdicts": counts,
+        "failures": sum(n for v, n in counts.items() if v in FAILURES) + len(missing),
+        "graded": len(graded),
         "pass_rate": round(passed / len(graded), 4) if graded else None,
         "tok_per_s": {"min": min(rates), "max": max(rates),
                       "mean": round(sum(rates) / len(rates), 2)} if rates else None,
@@ -428,6 +536,8 @@ def render_report(report: Dict[str, Any]) -> str:
     head = [f"## swarm report: {report.get('tasks', 0)} task(s)"
             + (f", model {report['model']}" if report.get("model") else ""), ""]
     head.append(f"- verdicts: {report.get('verdicts')}")
+    head.append(f"- failures: {report.get('failures', 0)} (FAIL, UNGROUNDED, "
+                "BUDGET_EXHAUSTED, ERROR or missing). ANSWERED means unverified.")
     if report.get("pass_rate") is not None:
         head.append(f"- graded pass rate: {report['pass_rate']} of {report.get('graded')}")
     if tps:
@@ -450,7 +560,7 @@ def self_test() -> int:
     import tempfile
     fails: List[str] = []
     root = Path(tempfile.mkdtemp()).resolve()
-    (root / "cfg.yaml").write_text("service: genesis\nport: 8001\n", encoding="utf-8")
+    (root / "cfg.yaml").write_text("service: api\nport: 8001\n", encoding="utf-8")
     script = iter(['<think>look first</think>'
                    '{"tool": "grep", "args": {"pattern": "port", "path": "."}}',
                    "not json at all",
@@ -462,16 +572,35 @@ def self_test() -> int:
         fails.append(f"happy path: {r}")
     if r["tok_per_s"] != 15.0:
         fails.append(f"tokens per second not taken from the server's stats: {r['tok_per_s']}")
+    looked = '{"tool": "read_file", "args": {"path": "cfg.yaml"}}'
+    wrong_script = iter([looked, '{"final": "9000"}'])
     wrong = solve({"id": "t2", "goal": "port?", "check": r"\b8001\b"},
-                  lambda m: '{"final": "9000"}', root, log=lambda s: None)
+                  lambda m: next(wrong_script), root, log=lambda s: None)
     if wrong["verdict"] != "FAIL":
         fails.append("a wrong answer was not graded FAIL")
+    guess_script = iter(['{"tool": "read_file", "args": {"path": "/path/to/cfg.yaml"}}',
+                         '{"final": "The port is 8001."}'])
+    hints: List[str] = []
+
+    def _guess(m: List[Dict[str, str]]) -> str:
+        hints.append(m[-1]["content"])
+        return next(guess_script)
+
+    guess = solve({"id": "t5", "goal": "port?", "check": r"\b8001\b"}, _guess, root,
+                  log=lambda s: None)
+    if guess["verdict"] != "UNGROUNDED":
+        fails.append(f"an answer given after the only tool call errored was graded "
+                     f"{guess['verdict']}; it was never looked up")
+    if '"cfg.yaml"' not in hints[-1]:
+        fails.append(f"an invented absolute path was not answered with the relative "
+                     f"form: {hints[-1]}")
     loop = solve({"id": "t3", "goal": "x", "max_steps": 3},
                  lambda m: '{"tool": "list_dir", "args": {}}', root, log=lambda s: None)
     if loop["verdict"] != "BUDGET_EXHAUSTED" or loop["steps"] != 3:
         fails.append("budget was not enforced")
     seen: List[str] = []
-    retry = iter(['{"final": null}', '{"number": 1, "summary": "x"}', '{"final": "done"}'])
+    retry = iter([looked, '{"final": null}', '{"number": 1, "summary": "x"}',
+                  '{"final": "null"}', '{"final": {"a": 1}}', '{"final": "done"}'])
 
     def _chat(m: List[Dict[str, str]]) -> str:
         seen.append(m[-1]["content"])
@@ -479,7 +608,7 @@ def self_test() -> int:
 
     again = solve({"id": "t4", "goal": "x"}, _chat, root, log=lambda s: None)
     if again["answer"] != "done" or [t["kind"] for t in again["trace"]] != [
-            "empty_final", "no_action", "final"]:
+            "tool", "empty_final", "no_action", "empty_final", "empty_final", "final"]:
         fails.append(f"an empty or shapeless reply was taken as the answer: {again}")
     if "cfg.yaml" not in seen[0]:
         fails.append("the first message does not show the repository root")
@@ -493,6 +622,8 @@ def self_test() -> int:
     rep = combine(parts, expect=["t1", "t2", "t9"])
     if rep["pass_rate"] != 0.5 or rep["verdicts"] != {"PASS": 1, "FAIL": 1}:
         fails.append(f"combine: {rep}")
+    if rep["failures"] != 2:
+        fails.append(f"a FAIL and a missing task are two failures, got {rep['failures']}")
     if rep["missing"] != ["t9"]:
         fails.append("a task that reported nothing was not listed as missing")
     try:
@@ -526,6 +657,8 @@ def self_test() -> int:
         ([{"id": "a", "goal": "g", "max_steps": MAX_STEPS + 1}], "", "max_steps"),
         ([{"id": "a", "goal": "g", "repo": "../etc"}], "", "owner/name"),
         ([{"id": "a/b", "goal": "g"}], "", "task id"),
+        ([{"id": "a", "goal": "g", "check": bs + "d+" + bs + "." + bs + "d+" + bs + "."
+           + bs + "d+"}], "", "too loose"),
         ([{"id": "a", "goal": "g", "fetch": ["secrets"], "repo": "o/r"}], "o", "fetch"),
         ([{"id": "a", "goal": "g"}, {"id": "a", "goal": "h"}], "", "twice"),
     ]
@@ -549,6 +682,15 @@ def self_test() -> int:
         fails.append(f"issues context is wrong: {issues}")
     if "#5" not in (made / ".swarm" / "merged_pulls.md").read_text(encoding="utf-8"):
         fails.append("merged pull requests were not written")
+    clean = [{"id": "c", "goal": "Which licence does pyproject.toml declare?"}]
+    if boundary_hits(clean):
+        fails.append(f"a clean task was refused at the boundary: {boundary_hits(clean)}")
+    token = "gh" + "p_" + "a" * 36
+    dirty = [{"id": "k", "goal": "use " + token}, {"id": "w", "goal": "read C:" + bs + "work"},
+             {"id": "i", "goal": "see TICKET-1234"}]
+    hits = boundary_hits(dirty, [("ticket-id", "TICKET-" + bs + "d+")])
+    if len(hits) != 3 or any(token in h for h in hits):
+        fails.append(f"boundary: wanted 3 findings that never echo the match, got {hits}")
     if main(["--list", "x.json", "--require-owner", "--allow-owner", ""]) != 2:
         fails.append("--require-owner with an empty owner did not stop the run")
     if "MISSING" not in render_report(rep) or "| t1 |" not in render_report(rep):
@@ -638,7 +780,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(json.dumps({k: v for k, v in res.items() if k != "trace"}, indent=2), flush=True)
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=2), encoding="utf-8")
-    return 0 if res["verdict"] in ("PASS", "ANSWERED", "FAIL") else 1
+    return 0 if res["verdict"] in ("PASS", "ANSWERED") else 1
 
 
 if __name__ == "__main__":
