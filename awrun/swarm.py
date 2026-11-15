@@ -58,6 +58,9 @@ SYSTEM = (
 MAX_OBS = 4000          # characters of tool output fed back per step
 GREP_HITS = 40
 MAX_INLINE = 60_000     # a workflow_dispatch input is capped near 65 KB
+MAX_TASKS = 32          # one job each: the cap on what a single dispatch can start
+MAX_STEPS = 20          # model turns per task
+MAX_TOKENS = 2048       # tokens the model may write per turn
 FETCHABLE = ("issues", "pulls")
 SIZES = ("2B", "4B", "9B")
 REPO_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$")
@@ -102,6 +105,9 @@ def run_tool(root: Path, name: str, args: Dict[str, Any]) -> str:
                     continue
                 if not f.is_file() or f.stat().st_size > 2_000_000:
                     continue
+                real = f.resolve()
+                if real != root and root not in real.parents:
+                    continue        # a symlink out of the clone is not readable
                 try:
                     for i, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
                         if rx.search(ln):
@@ -225,6 +231,9 @@ def validate_tasks(doc: Any, allow_owner: str = "") -> List[Dict[str, Any]]:
     tasks = tasks if isinstance(tasks, list) else [tasks]
     if not tasks:
         raise ValueError("the task list is empty")
+    if len(tasks) > MAX_TASKS:
+        raise ValueError(f"{len(tasks)} tasks; one swarm runs at most {MAX_TASKS} "
+                         "(each is a CI job). Split it.")
     seen = set()
     for t in tasks:
         if not isinstance(t, dict):
@@ -242,17 +251,20 @@ def validate_tasks(doc: Any, allow_owner: str = "") -> List[Dict[str, Any]]:
         if repo is not None:
             if not isinstance(repo, str) or not REPO_RX.match(repo) or ".." in repo:
                 raise ValueError(f"task {tid}: repo must be owner/name, got {repo!r}")
-            if allow_owner and repo.split("/", 1)[0].lower() != allow_owner.lower():
-                raise ValueError(f"task {tid}: repo {repo} is outside {allow_owner}; "
-                                 "this swarm only reads that owner's repositories")
+            # Fails CLOSED: with no owner named, no repository is allowed at all.
+            if not allow_owner or repo.split("/", 1)[0].lower() != allow_owner.lower():
+                raise ValueError(f"task {tid}: repo {repo} is outside "
+                                 f"{allow_owner or '(no owner was named)'}; a swarm only "
+                                 "reads the repositories of the owner it runs under")
         fetch = t.get("fetch") or []
         if not isinstance(fetch, list) or any(f not in FETCHABLE for f in fetch):
             raise ValueError(f"task {tid}: fetch takes a list of {list(FETCHABLE)}")
         if fetch and not repo:
             raise ValueError(f"task {tid}: fetch needs a repo")
         steps = t.get("max_steps", 12)
-        if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 40:
-            raise ValueError(f"task {tid}: max_steps must be 1-40")
+        if (not isinstance(steps, int) or isinstance(steps, bool)
+                or not 1 <= steps <= MAX_STEPS):
+            raise ValueError(f"task {tid}: max_steps must be 1-{MAX_STEPS}")
         check = t.get("check") or ""
         if not isinstance(check, str):
             raise ValueError(f"task {tid}: check is a regex string")
@@ -459,14 +471,28 @@ def self_test() -> int:
             fails.append(f"duplicate refused for the wrong reason: {exc}")
     bs = chr(92)
     ok = [{"id": "a", "goal": "g", "repo": "Aitherium/awrun", "check": bs + "b22" + bs + "b"}]
+    outside = root.parent / (root.name + "-outside.txt")
+    outside.write_text("port 9999 secret", encoding="utf-8")
+    try:
+        (root / "link.txt").symlink_to(outside)
+        if "9999" in run_tool(root, "grep", {"pattern": "port", "path": "."}):
+            fails.append("grep read through a symlink that leaves the root")
+        if "escapes" not in run_tool(root, "read_file", {"path": "link.txt"}):
+            fails.append("read_file followed a symlink that leaves the root")
+        (root / "link.txt").unlink()
+    except OSError:
+        pass        # this platform cannot make a symlink; nothing to follow either
     if validate_tasks({"tasks": ok}, "aitherium")[0]["id"] != "a":
         fails.append("a valid task list did not load")
     refusals = [
         ([{"id": "a", "goal": "g", "check": chr(8) + "22" + chr(8)}], "", "control character"),
         ([{"id": "a", "goal": "g", "repo": "someone/else"}], "Aitherium", "outside"),
+        ([{"id": "a", "goal": "g", "repo": "Aitherium/awrun"}], "", "no owner was named"),
+        ([{"id": f"t{i}", "goal": "g"} for i in range(MAX_TASKS + 1)], "", "at most"),
+        ([{"id": "a", "goal": "g", "max_steps": MAX_STEPS + 1}], "", "max_steps"),
         ([{"id": "a", "goal": "g", "repo": "../etc"}], "", "owner/name"),
         ([{"id": "a/b", "goal": "g"}], "", "task id"),
-        ([{"id": "a", "goal": "g", "fetch": ["secrets"], "repo": "o/r"}], "", "fetch"),
+        ([{"id": "a", "goal": "g", "fetch": ["secrets"], "repo": "o/r"}], "o", "fetch"),
         ([{"id": "a", "goal": "g"}, {"id": "a", "goal": "h"}], "", "twice"),
     ]
     for doc, owner, why in refusals:
@@ -510,13 +536,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE",
                     help="with --combine: a fact to record in the report (model=4B)")
     ap.add_argument("--markdown", help="with --combine: also write the report as Markdown")
-    ap.add_argument("--allow-owner", default="", help="refuse a task whose repo has "
-                                                      "another owner")
+    ap.add_argument("--allow-owner", default="",
+                    help="the only owner whose repositories a task may name; without "
+                         "it every task that names a repository is refused")
     ap.add_argument("--root", help="the tree the tools may read (default: task.root or cwd)")
     ap.add_argument("--url", default="http://127.0.0.1:8090")
     ap.add_argument("--model", default="bonsai2")
     ap.add_argument("--timeout", type=int, default=900)
-    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--out", help="write the result / report here")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
@@ -527,7 +554,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps([t["id"] for t in load_tasks(a.list, a.allow_owner)]))
             return 0
         if a.combine is not None:
-            expect = [t["id"] for t in load_tasks(a.expect)] if a.expect else None
+            expect = ([t["id"] for t in load_tasks(a.expect, a.allow_owner)]
+                      if a.expect else None)
             meta = dict(kv.split("=", 1) for kv in a.meta if "=" in kv)
             rep = combine(a.combine, expect, meta)
             text = render_report(rep)
@@ -555,7 +583,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     root = Path(a.root or task.get("root") or os.getcwd()).resolve()
     try:
-        res = solve(task, http_chat(a.url, a.model, a.timeout, a.max_tokens), root)
+        res = solve(task, http_chat(a.url, a.model, a.timeout,
+                                    min(max(a.max_tokens, 1), MAX_TOKENS)), root)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         # The model server died or answered garbage: a result still exists, so the
         # report shows this task as an error instead of losing it.
