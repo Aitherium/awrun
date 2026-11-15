@@ -269,9 +269,16 @@ jobs:
           ls -la sd_turbo.safetensors
       - name: Bench
         run: |
-          /usr/bin/time -v python scripts/image_cpu_bench.py ${{ matrix.engine }} bench-out             --sd-bin "${SD_BIN:-}" --model "$PWD/sd_turbo.safetensors" 2> bench-out-time.txt || echo "bench exited $?"
-          grep -E "Maximum resident|Elapsed" bench-out-time.txt || true
-          mkdir -p bench-out && cp bench-out-time.txt bench-out/ || true
+          mkdir -p bench-out
+          extra=""
+          if [ "${{ matrix.engine }}" = "sdcpp" ]; then
+            extra="--sd-bin $SD_BIN --model $PWD/sd_turbo.safetensors"
+          fi
+          rc=0
+          /usr/bin/time -v -o bench-out/time.txt python scripts/image_cpu_bench.py ${{ matrix.engine }} bench-out $extra || rc=$?
+          grep -E "Maximum resident|Elapsed" bench-out/time.txt
+          # A failed bench is a failed job: the JSON records why, the exit code says so.
+          exit "$rc"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
