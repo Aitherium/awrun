@@ -37,9 +37,14 @@ BUDGET_EXHAUSTED: no usable answer inside the step budget (an empty, null or non
 `final` is not an answer). ERROR: the model server failed. Everything except PASS and
 ANSWERED is a failure in the report.
 
+The repository listing shown in the first message is not a tool call: a task that
+could be answered from it alone still has to read something, or it is UNGROUNDED.
+
 A `check` must pin the expected value. One that also matches a placeholder ("0.0.0",
 "1.2.3", "unknown", ...) is refused: on the first real run a version-shaped regex graded
-an invented "1.0.0" as PASS. Read the true value before dispatch and write it in.
+an invented "1.0.0" as PASS. Read the true value before dispatch and write it in. "yes" and "no" are
+placeholders too, so a yes/no question cannot carry a check: phrase the task so the
+answer names the thing ("Apache-2.0: agree"), or leave it unchecked (ANSWERED).
 
 Exit: 0 done, 1 a task is missing from the report / budget exhausted, 2 could not run.
 """
@@ -76,6 +81,8 @@ MAX_INLINE = 60_000     # a workflow_dispatch input is capped near 65 KB
 MAX_TASKS = 32          # one job each: the cap on what a single dispatch can start
 MAX_STEPS = 20          # model turns per task
 MAX_TOKENS = 2048       # tokens the model may write per turn
+#: A whole answer that says nothing: treated as an empty `final`.
+NON_ANSWERS = frozenset({"", "null", "none", "n/a", "unknown"})
 FAILURES = frozenset({"FAIL", "UNGROUNDED", "BUDGET_EXHAUSTED", "ERROR"})
 #: Strings a model writes when it has not looked. A check that accepts one of
 #: them grades a guess as PASS, so such a check is refused.
@@ -106,7 +113,15 @@ def _path_hint(root: Path, rel: Any) -> Optional[str]:
     name = text.replace(chr(92), "/").rstrip("/").rsplit("/", 1)[-1].strip("<>")
     stripped = text.lstrip("/")
     for guess in (stripped, name):
-        if guess and "<" not in guess and (root / guess).exists():
+        if not guess or "<" in guess:
+            continue
+        try:
+            # Only ever suggest a path INSIDE the clone: `/../../etc/passwd` must not
+            # be answered with a hint that confirms the file exists.
+            inside = _safe(root, guess).exists()
+        except (OSError, ValueError):
+            inside = False
+        if inside:
             return (f'error: {text!r} is not a path in this repository. Paths are relative '
                     f'to the repository root: use "{guess}".')
     return (f'error: {text!r} is not a path in this repository. Paths are relative to the '
@@ -241,7 +256,7 @@ def solve(task: Dict[str, Any], chat: Callable, root: Path,
                    'Reply with {"tool": ...} or {"final": ...}.')
             steps.append({"n": n, "kind": "unparsed"})
         elif "final" in act and (not isinstance(act["final"], str)
-                                 or act["final"].strip().lower() in ("", "null", "none")):
+                                 or act["final"].strip().lower() in NON_ANSWERS):
             # Empty, null or not a string: not an answer. Say so; the model may retry.
             obs = ('error: "final" must be a non-empty string holding your whole answer '
                    '(a table goes inside the string).')
@@ -517,6 +532,7 @@ def combine(paths: List[str], expect: Optional[List[str]] = None,
     report: Dict[str, Any] = {
         "tasks": len(rows), "missing": missing, "verdicts": counts,
         "failures": sum(n for v, n in counts.items() if v in FAILURES) + len(missing),
+        "ungrounded": counts.get("UNGROUNDED", 0),
         "graded": len(graded),
         "pass_rate": round(passed / len(graded), 4) if graded else None,
         "tok_per_s": {"min": min(rates), "max": max(rates),
@@ -538,6 +554,8 @@ def render_report(report: Dict[str, Any]) -> str:
     head.append(f"- verdicts: {report.get('verdicts')}")
     head.append(f"- failures: {report.get('failures', 0)} (FAIL, UNGROUNDED, "
                 "BUDGET_EXHAUSTED, ERROR or missing). ANSWERED means unverified.")
+    head.append(f"- ungrounded: {report.get('ungrounded', 0)} (answered without one "
+                "successful tool call; never graded)")
     if report.get("pass_rate") is not None:
         head.append(f"- graded pass rate: {report['pass_rate']} of {report.get('graded')}")
     if tps:
@@ -588,6 +606,17 @@ def self_test() -> int:
 
     guess = solve({"id": "t5", "goal": "port?", "check": r"\b8001\b"}, _guess, root,
                   log=lambda s: None)
+    same_script = iter([looked, '{"final": "The port is 8001."}'])
+    same = solve({"id": "t6", "goal": "port?", "check": r"\b8001\b"},
+                 lambda m: next(same_script), root, log=lambda s: None)
+    if same["verdict"] != "PASS":
+        fails.append(f"the same answer after a successful tool call was {same['verdict']}")
+    beside = root.parent / (root.name + "-beside.txt")
+    beside.write_text("x", encoding="utf-8")
+    if 'use "' in run_tool(root, "read_file", {"path": "/../" + beside.name}):
+        fails.append("a path hint suggested a file that exists OUTSIDE the root")
+    if 'use "cfg.yaml"' not in run_tool(root, "read_file", {"path": "/cfg.yaml"}):
+        fails.append("a path hint did not suggest the file inside the root")
     if guess["verdict"] != "UNGROUNDED":
         fails.append(f"an answer given after the only tool call errored was graded "
                      f"{guess['verdict']}; it was never looked up")
@@ -600,15 +629,18 @@ def self_test() -> int:
         fails.append("budget was not enforced")
     seen: List[str] = []
     retry = iter([looked, '{"final": null}', '{"number": 1, "summary": "x"}',
-                  '{"final": "null"}', '{"final": {"a": 1}}', '{"final": "done"}'])
+                  '{"final": "null"}', '{"final": {"a": 1}}', '{"final": " N/A "}',
+                  '{"final": "Unknown"}', '{"final": "done"}'])
 
     def _chat(m: List[Dict[str, str]]) -> str:
         seen.append(m[-1]["content"])
         return next(retry)
 
-    again = solve({"id": "t4", "goal": "x"}, _chat, root, log=lambda s: None)
+    again = solve({"id": "t4", "goal": "x", "max_steps": 10}, _chat, root,
+                  log=lambda s: None)
     if again["answer"] != "done" or [t["kind"] for t in again["trace"]] != [
-            "tool", "empty_final", "no_action", "empty_final", "empty_final", "final"]:
+            "tool", "empty_final", "no_action", "empty_final", "empty_final",
+            "empty_final", "empty_final", "final"]:
         fails.append(f"an empty or shapeless reply was taken as the answer: {again}")
     if "cfg.yaml" not in seen[0]:
         fails.append("the first message does not show the repository root")
@@ -622,6 +654,8 @@ def self_test() -> int:
     rep = combine(parts, expect=["t1", "t2", "t9"])
     if rep["pass_rate"] != 0.5 or rep["verdicts"] != {"PASS": 1, "FAIL": 1}:
         fails.append(f"combine: {rep}")
+    if combine(parts)["ungrounded"] != 0:
+        fails.append("ungrounded count is wrong")
     if rep["failures"] != 2:
         fails.append(f"a FAIL and a missing task are two failures, got {rep['failures']}")
     if rep["missing"] != ["t9"]:
