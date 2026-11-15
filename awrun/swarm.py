@@ -679,8 +679,10 @@ def self_test() -> int:
         if "link.txt@" not in run_tool(root, "list_dir", {"path": "."}):
             fails.append("list_dir did not mark a symlink")
         (root / "link.txt").unlink()
-    except OSError:
-        pass        # this platform cannot make a symlink; nothing to follow either
+    except OSError as exc:
+        # This platform cannot make a symlink, so there is nothing to follow either.
+        # Said out loud: a skipped case must not read as a tested one.
+        print(f"self-test: symlink cases skipped ({type(exc).__name__})")
     if validate_tasks({"tasks": ok}, "aitherium")[0]["id"] != "a":
         fails.append("a valid task list did not load")
     refusals = [
