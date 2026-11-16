@@ -303,15 +303,24 @@ def _submit_comet_deploy_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
-def _authorize_gated(kind: str, spec: dict) -> Optional[str]:
+def _authorize_gated(kind: str, spec, approval_id: str = "",
+                     options: Optional[dict] = None) -> Optional[str]:
     """Phase 8 (generalised 2026-09-19): every kind in `authz.KIND_PERMISSIONS`
     is gated -- comet-deploy (money) and tunnel (perimeter). Returns an error
     string on denial, or None on success -- resolving, checking and auditing
     happen together here so a caller cannot accidentally submit without all
     three. Fails CLOSED at every step: no token, no resolution, no permission,
-    or a failed audit write are ALL refusals, never a silent allow."""
+    or a failed audit write are ALL refusals, never a silent allow.
+
+    Two credentials, one door: an owner's approval (`approval_id`; only `submit`
+    passes one, so `apply` and a dry run can never spend it) decided on the platform
+    and spent here on exactly `spec` (a list = one batch) and the queue `options`,
+    or the local awiam session below."""
     from awrun import authz
 
+    approval_id = (approval_id or "").strip()
+    if approval_id:
+        return _authorize_by_approval(kind, spec, approval_id, options)
     permission = authz.KIND_PERMISSIONS[kind]
     token = os.getenv("AITHER_SESSION_BEARER", "").strip()
     subject_id = authz.resolve_session(token)
@@ -334,6 +343,133 @@ def _authorize_gated(kind: str, spec: dict) -> Optional[str]:
         # even though the authz decision itself was ALLOW.
         return f"{kind} refused: could not write the audit record (spend must be auditable)"
     return None
+
+
+def _authorize_by_approval(kind: str, spec, approval_id: str,
+                           options: Optional[dict] = None) -> Optional[str]:
+    """Spend an owner's platform approval on exactly these runs (`awrun.approval`).
+
+    The record that the approval was PRESENTED is written before it is spent, so an
+    unwritable trail refuses before an approval is burned. The approver -- the human
+    who decided it from a fresh passkey/TOTP session -- is the audited subject. Who
+    may approve: the plane's owners/admins, narrowed by `approval.check_approver`
+    (the asking account itself, or $AWRUN_APPROVERS) before anything is spent."""
+    from awrun import approval, authz
+
+    specs = spec if isinstance(spec, list) else [spec]
+    try:
+        bound = approval.digest(approval.payload(kind, specs, options))
+    except approval.ApprovalRefusedError as exc:
+        authz.audit(f"{kind}-denied", reason=str(exc), approval_id=approval_id, spec=spec)
+        return f"{kind} refused: {exc}"
+    spent = _already_spent_here(approval_id)
+    if spent:
+        authz.audit(f"{kind}-denied", reason=spent, approval_id=approval_id,
+                    payload_digest=bound, spec=spec)
+        return f"{kind} refused: {spent}"
+    if authz.audit(f"{kind}-approval-presented", approval_id=approval_id,
+                   action=approval.action_for(kind), payload_digest=bound, spec=spec) is None:
+        return f"{kind} refused: could not write the audit record (spend must be auditable)"
+    try:
+        got = approval.consume(approval_id, kind, specs, options)
+    except approval.ApprovalRefusedError as exc:
+        authz.audit(f"{kind}-denied", reason=str(exc), approval_id=approval_id,
+                    payload_digest=bound, spec=spec)
+        return f"{kind} refused: {exc}"
+    record = authz.audit(f"{kind}-submitted", subject=got["approver"],
+                         via="agent-approval", approval_id=approval_id,
+                         action=got["action"], payload_digest=got["payload_digest"],
+                         requested_by=got["requested_by"],
+                         permission=authz.KIND_PERMISSIONS[kind], spec=spec)
+    if record is None:
+        return (f"{kind} refused: approval {approval_id} was spent but the audit record "
+                f"could not be written (spend must be auditable); ask again")
+    return None
+
+
+def _already_spent_here(approval_id: str) -> str:
+    """Why this approval may not be spent again ON THIS HOST, or "". Genesis spends an
+    approval once; this trail says so too, so a replayed answer (a recorded consume,
+    signature and all) opens nothing twice. An unreadable trail is a refusal."""
+    from awrun import authz
+
+    path = authz._audit_log_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return f"the audit trail {path} is unreadable ({type(exc).__name__})"
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        data = rec.get("data") if isinstance(rec, dict) else None
+        if (isinstance(data, dict) and data.get("approval_id") == approval_id
+                and str(rec.get("event") or "").endswith("-submitted")):
+            return f"approval {approval_id} was already spent on this host"
+    return ""
+
+
+def _session_authorizes(kind: str) -> bool:
+    """Would the local awiam session pass this kind's gate? No audit, no side effect."""
+    from awrun import authz
+
+    subject = authz.resolve_session(os.getenv("AITHER_SESSION_BEARER", "").strip())
+    return bool(subject) and bool(authz.check_permission(subject, authz.KIND_PERMISSIONS[kind]))
+
+
+def _ask_owner(kind: str, specs: list, summary: str, args: argparse.Namespace,
+               options: Optional[dict] = None) -> "tuple[Optional[str], str, int]":
+    """(approval_id, refusal, rc) for `submit --ask-owner`.
+
+    A session that already authorizes this kind is used as-is (approval_id ""). Else
+    ONE approval is requested for the whole batch, the owner is told on every surface
+    the platform has (`approval.notify_surfaces`), and this waits for the decision.
+    Progress goes to stderr; stdout stays the submit's own output."""
+    from awrun import approval
+
+    if _session_authorizes(kind):
+        return "", "", 0
+
+    def say(msg: str) -> None:
+        print(f"awrun: {msg}", file=sys.stderr, flush=True)
+
+    try:
+        view = approval.request(kind, specs, summary, options=options,
+                                ttl_minutes=getattr(args, "approval_ttl_minutes", None) or 60)
+        aid = view["approval_id"]
+        say(f"owner approval {aid} requested for {len(specs)} {kind} run(s); decide at "
+            f"{approval.page_url(aid)}")
+        for surface, note in approval.notify_surfaces(view).items():
+            say(f"  {surface:8} {note}")
+        say("waiting for the owner's decision ...")
+        seen = {"status": "pending"}
+
+        def tick(v: dict) -> None:
+            if v.get("status") != seen["status"]:
+                seen["status"] = v.get("status")
+                say(f"approval {aid}: {v.get('status')}")
+
+        final = approval.wait(aid, poll_s=getattr(args, "approval_poll_s", None) or 10.0,
+                              timeout_s=getattr(args, "approval_timeout_s", None),
+                              on_poll=tick)
+    except approval.ApprovalUnavailableError as exc:
+        return None, f"{kind} not submitted: {exc}", 2
+    except approval.ApprovalRefusedError as exc:
+        return None, f"{kind} not submitted: {exc}", 1
+    state = final.get("status")
+    if state == "approved":
+        decided = (final.get("decided_by") or {}).get("user_id") or "?"
+        say(f"approval {aid} approved by {decided}")
+        return aid, "", 0
+    if state == "pending":
+        # Nobody will spend it now: withdraw it so the owner is not asked for nothing.
+        gone = approval.withdraw(aid, "awrun stopped waiting (--approval-timeout-s)")
+        return None, (f"{kind} not submitted: approval {aid} was still pending when the wait "
+                      f"ran out ({'withdrawn' if gone else 'NOT withdrawn'})"), 2
+    return None, f"{kind} not submitted: approval {aid} is {state}", 1
 
 
 def _authorize_comet_deploy(spec: dict) -> Optional[str]:
@@ -573,13 +709,55 @@ def _build_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
-def _authorize(kind: str, spec: dict) -> Optional[str]:
+#: Flags that would set the same key on every run of a batch: refused with a list
+#: --spec-json, where each run carries its own keys.
+_NODE_OP_RUN_FLAGS = ("node", "action", "model", "headroom_gb", "node_dry_run",
+                      "controller", "pin_sha256", "force")
+
+
+def _build_specs(args: argparse.Namespace) -> list:
+    """The run spec(s) a submit queues. A JSON LIST in `--spec-json` is a batch
+    (node-op only): every element is built and validated exactly as a single
+    `--spec-json` object would be, so an approval asked for the batch binds the
+    same bytes the submit queues. Raises RunError."""
+    raw = getattr(args, "spec_json", None)
+    batch = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RunError(f"--spec-json is not valid JSON: {exc}") from exc
+        if isinstance(parsed, list):
+            batch = parsed
+    if batch is None:
+        return [_build_spec(args)]
+    if args.kind != "node-op":
+        raise RunError("a JSON list in --spec-json (a batch) is for --kind node-op only")
+    if not batch:
+        raise RunError("--spec-json is an empty list: nothing to queue")
+    set_flags = [f for f in _NODE_OP_RUN_FLAGS if getattr(args, f, None)]
+    if set_flags:
+        raise RunError(f"a batch --spec-json carries each run's keys; drop "
+                       f"{', '.join('--' + f.replace('_', '-') for f in set_flags)}")
+    if getattr(args, "name", None):
+        raise RunError("--name names ONE run; a batch cannot carry it")
+    specs = []
+    for element in batch:
+        if not isinstance(element, dict):
+            raise RunError(f"every run in a batch is a JSON object, got {element!r}")
+        one = argparse.Namespace(**vars(args))
+        one.spec_json = json.dumps(element)
+        specs.append(_build_spec(one))
+    return specs
+
+
+def _authorize(kind: str, spec, approval_id: str = "") -> Optional[str]:
     """None = allowed. Only kinds in `authz.KIND_PERMISSIONS` are gated; this is
     the ONE place a write path asks, so `apply` cannot submit what `submit` refuses."""
     from awrun import authz
     if kind not in authz.KIND_PERMISSIONS:
         return None
-    return _authorize_gated(kind, spec)
+    return _authorize_gated(kind, spec, approval_id)
 
 
 def _constraints(args: argparse.Namespace) -> dict:
@@ -609,24 +787,87 @@ def _constraints(args: argparse.Namespace) -> dict:
 
 
 def cmd_submit(args: argparse.Namespace, store: RunStore) -> int:
+    from awrun import authz
     try:
-        spec = _build_spec(args)
+        specs = _build_specs(args)
         extra = _constraints(args)
     except RunError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    denial = _authorize(args.kind, spec)
-    if denial is not None:
-        print(f"ERROR: {denial}", file=sys.stderr)
-        return 1
+    batch = len(specs) > 1 or isinstance(_json_or_none(getattr(args, "spec_json", None)), list)
+    bound = specs if batch else specs[0]
+    # Everything the store would refuse is refused HERE, before an approval is spent:
+    # an approval burned on a submit that then queues nothing is an ask wasted.
     try:
-        item = store.submit(args.kind, spec, priority=args.priority,
-                             paths=args.paths or [], **extra)
+        _prevalidate(store, args.kind, specs, extra)
     except RunError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    _print_item(item, as_json=args.json)
+    # The queue options are approved WITH the runs (they change what runs, and where).
+    options = {"priority": args.priority, "paths": list(args.paths or []), **extra}
+    summary = (getattr(args, "ask_owner", None) or "").strip()
+    approval_id = (getattr(args, "approval_id", None) or "").strip()
+    if not approval_id and not summary:
+        approval_id = os.getenv("AWRUN_APPROVAL_ID", "").strip()
+    if summary and approval_id:
+        print("ERROR: --ask-owner requests an approval; --approval spends one. Pick one.",
+              file=sys.stderr)
+        return 2
+    if summary and args.kind in authz.KIND_PERMISSIONS:
+        approval_id, refusal, rc = _ask_owner(args.kind, specs, summary, args, options)
+        if approval_id is None:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+            return rc
+    if approval_id and args.kind in authz.KIND_PERMISSIONS:
+        denial = _authorize_gated(args.kind, bound, approval_id, options)
+    else:
+        denial = _authorize(args.kind, bound)
+    if denial is not None:
+        print(f"ERROR: {denial}", file=sys.stderr)
+        return 1
+    items = []
+    try:
+        for spec in specs:
+            items.append(store.submit(args.kind, spec, priority=args.priority,
+                                      paths=args.paths or [], **extra))
+    except RunError as exc:
+        print(f"ERROR: {exc} ({len(items)} of {len(specs)} queued: "
+              f"{', '.join(i.id for i in items) or 'none'})", file=sys.stderr)
+        return 2
+    if batch and args.json:
+        print(json.dumps([i.to_dict() for i in items], indent=2))
+        return 0
+    for item in items:
+        _print_item(item, as_json=args.json)
     return 0
+
+
+def _prevalidate(store: RunStore, kind: str, specs: list, extra: dict) -> None:
+    """The checks `RunStore.submit` makes, made first, for every run. Raises RunError."""
+    from awrun.store import (
+        validate_egress,
+        validate_gpu,
+        validate_limits,
+        validate_lineage,
+        validate_name,
+    )
+
+    name = validate_name(extra.get("name") or "")
+    validate_lineage(extra.get("lineage"))
+    validate_limits(extra.get("limits"))
+    validate_egress(extra.get("egress"))
+    if name and store.find_by_name(name) is not None:
+        raise RunError(f"an open run is already named {name!r}; "
+                       f"use apply to converge it, or cancel it first")
+    for spec in specs:
+        validate_gpu(kind, spec.get("gpu") if isinstance(spec, dict) else None)
+
+
+def _json_or_none(raw: Optional[str]):
+    try:
+        return json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        return None
 
 
 def _guarded(action: str, run_id: str = "", **fields) -> bool:
@@ -1167,7 +1408,8 @@ def build_parser() -> argparse.ArgumentParser:
                                           "sovereign-iso|aitherzero-playbook|omninode)")
     submit.add_argument("--spec-json", dest="spec_json",
                          help="[kind=comet-deploy] full AitherComet DeployRequest body as "
-                              "a JSON object; --service-name/--target override matching keys")
+                              "a JSON object; --service-name/--target override matching keys. "
+                              "[kind=node-op] the spec, or a JSON LIST of specs = one batch")
     submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS + _NODE_OP_ACTIONS),
                          help="[kind=tunnel] expose|retire; [kind=node-op] "
                               "provision|recover|check|fleet-join|fleet-leave|"
@@ -1194,6 +1436,23 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--force", action="store_true",
                          help="[kind=node-op] fleet-join: re-join an approved node; "
                               "fleet-leave: revoke although units are still placed")
+
+    submit.add_argument("--approval", dest="approval_id",
+                         help="[gated kinds] spend this owner approval (apr-...) decided on "
+                              "the platform, instead of an awiam session; it must cover "
+                              "exactly these runs ($AWRUN_APPROVAL_ID works too)")
+    submit.add_argument("--ask-owner", dest="ask_owner", metavar="SUMMARY",
+                         help="[gated kinds] when no awiam session authorizes this kind, ask "
+                              "the workspace owner on the platform (app, mail, awdesk, "
+                              "Discord) with this summary, wait for the decision, then "
+                              "submit under it. A --spec-json LIST is one approval")
+    submit.add_argument("--approval-ttl-minutes", dest="approval_ttl_minutes", type=int,
+                         help="[--ask-owner] how long the owner may take (1-1440, default 60)")
+    submit.add_argument("--approval-timeout-s", dest="approval_timeout_s", type=float,
+                         help="[--ask-owner] stop waiting after this many seconds "
+                              "(default: until decided or expired)")
+    submit.add_argument("--approval-poll-s", dest="approval_poll_s", type=float,
+                         help="[--ask-owner] seconds between status polls (default 10)")
 
     submit.add_argument("--experiment", help="[kind=lab-run] registered experiment name")
     submit.add_argument("--budget-cap-usd", dest="budget_cap_usd", type=float,

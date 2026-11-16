@@ -93,7 +93,7 @@ in `awrun/deploy.py`.
 Not a new daemon. `decisions/store.py` already proves a durable, pollable,
 cross-process queue doesn't need one — `awrun dispatch` (via
 `awrun.dispatcher`) runs as a scheduled task or a one-shot `--once`
-invocation, matching `AitherOS/config/routines/*.yaml`'s existing pattern.
+invocation, matching the scheduled-routine pattern of the platform it came from.
 
 Not a replacement for required PR-gate CI, which stays on GitHub Actions'
 native triggers. `awrun` targets ad-hoc dispatches only.
@@ -126,6 +126,40 @@ urgent item can jump.
 > practice** — nobody calls it, so nothing exercises it, so nobody notices it
 > works. A repo-side check now asserts this section against the dispatcher's
 > own routing table, so it cannot drift back.
+
+### Gated kinds without a terminal: the owner approves on the platform
+
+A gated kind (`comet-deploy`, `tunnel`, `lab-run`, `node-op`) also accepts an owner's
+approval decided on an AitherOS platform (Genesis `/api/v1/agent-approvals`): the owner
+reads the exact runs and approves in a browser with a passkey or authenticator app, and
+the submit spends that approval once, on exactly those runs.
+
+```bash
+# ask, notify, wait, then queue -- uses the awiam session instead when one authorizes
+awrun submit --kind node-op --spec-json '[{"node":"a","action":"secret-status"},
+                                          {"node":"b","action":"secret-status"}]' \
+      --ask-owner "read which secret pair each node holds"
+# spend an approval somebody already asked for (or set AWRUN_APPROVAL_ID)
+awrun submit --kind node-op --spec-json '{"node":"a","action":"secret-status"}' \
+      --approval apr-0123456789abcdef
+```
+
+The approval is bound to `awrun:<kind>` and to the sha256 of a text built only from the
+runs and their queue options (one readable line each, then their canonical JSON); one
+key different is another digest and is refused. A JSON list is one batch: one approval,
+one consume. The decider must be the account that asked (the owner approving his own ask
+from a passkey session) or be named in `AWRUN_APPROVERS`; that is checked before the
+approval is spent. Both calls carry the operator's own platform bearer
+(`AWRUN_APPROVAL_BEARER`, else `~/.aither/session-bearer`) through the platform's MCP
+gateway (as its service registry resolves it; the gateway's `approval_*` tools forward
+that bearer to Genesis, which is not published to a host outside the fleet); no environment variable can name another URL (`AWRUN_APPROVAL_URL` is
+refused), and redirects are never followed. What grants is the receipt
+Genesis SIGNS for the spend (Ed25519, the platform attestation key), verified against
+the public key pinned in the file named by `AWSTORAGE_ATTEST_PUBKEY_FILE`: for this
+approval, action, payload and decider, signed within five minutes, and never spent
+twice on this host (`pip install 'awrun[approval]'`). Every failure is a
+refusal; the human who decided is the audited subject. `AWRUN_APPROVAL_ID` is read by
+`submit` only, so `apply` and dry runs never spend an approval.
 
 ## Stateful runs: suspend, resume, move
 

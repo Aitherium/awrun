@@ -32,6 +32,10 @@ flow = ["aitherium-awflow>=0.2.1"]
 # Identity, policy, audit trail and sealed handoff. All optional: without them a
 # single-user queue still works, and a gated action is refused rather than allowed.
 governed = ["awiam", "awbac", "awdit", "awseal", "awshare"]
+# `submit --approval` / `--ask-owner`: the platform-approval lane verifies Genesis'
+# signed consume receipt (Ed25519) against the key awstorage pins. Without these a
+# gated submit by approval is refused, never allowed.
+approval = ["awstorage", "cryptography"]
 
 dev = ["pytest>=7.0"]
 
