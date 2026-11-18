@@ -51,6 +51,23 @@ awrun cancel r-7f3a9c2e
 awrun status r-7f3a9c2e
 ```
 
+### A swarm of small models on hosted runners
+
+```bash
+awrun swarm submit tasks.json --size 4B --run   # dispatch, wait, collect the report
+awrun swarm result r-7f3a9c2e                   # read it again: verdicts, answers, tokens/s
+```
+
+`tasks.json` is a list of single, narrowly scoped questions, each about ONE public
+repository (`{"id", "goal", "repo": "owner/name", "check": "<regex>", "fetch": ["issues"]}`).
+Every task gets its own hosted CI job (`.github/workflows/bonsai-swarm.yml`): the job
+clones the repository, serves a 2B-9B Bonsai 2 model on the runner's CPU and runs
+`awrun/swarm.py`, a loop with read-only file tools and a step budget. The jobs hold no
+secret and never call back: the queue pulls the `swarm-report` artifact with the `gh`
+login it dispatched with, and the run is `done` when the report is on local disk. Any
+`ci` run can do the same with `submit --kind ci --collect <artifact>`, provided its
+workflow shows the `awrun_id` input in `run-name`.
+
 `AITHER_AWRUN_DIR` overrides the store location (default
 `~/.aither/awrun/`) — set it in tests and for per-tenant isolation.
 

@@ -658,6 +658,12 @@ def _build_spec(args: argparse.Namespace) -> dict:
             k, v = kv.split("=", 1)
             inputs[k] = v
         spec["inputs"] = inputs
+        if getattr(args, "collect", None):
+            if not spec.get("repo"):
+                raise RunError("--collect needs --repo: the artifact is fetched by run id")
+            spec["collect"] = {"artifact": args.collect,
+                               "timeout_s": float(getattr(args, "collect_timeout_s", None)
+                                                  or 5400)}
     elif kind == "comet-deploy":
         spec = _submit_comet_deploy_spec(args)
         if not spec.get("service_name"):
@@ -1401,6 +1407,13 @@ def build_parser() -> argparse.ArgumentParser:
                                        "the dispatcher's cwd repo, or $GH_REPO)")
     submit.add_argument("--field", action="append",
                          help="[kind=ci] workflow_dispatch input as key=value, repeatable")
+    submit.add_argument("--collect", metavar="ARTIFACT",
+                         help="[kind=ci] wait for the run and download this artifact "
+                              "beside the queue; the run is done when the artifact is "
+                              "here. The workflow must put its `awrun_id` input in "
+                              "`run-name`")
+    submit.add_argument("--collect-timeout-s", dest="collect_timeout_s", type=float,
+                         help="[kind=ci] how long --collect waits for the run (default 5400)")
     submit.add_argument("--service-name", dest="service_name",
                          help="[kind=comet-deploy] AitherComet DeployRequest.service_name")
     submit.add_argument("--target", help="[kind=comet-deploy] deploy target "
@@ -1609,6 +1622,33 @@ def build_parser() -> argparse.ArgumentParser:
                       help="ref to dispatch against (default: main)")
     surf.add_argument("--execute", action="store_true",
                       help="with --dispatch, actually start the runs")
+
+    swarm = sub.add_parser(
+        "swarm", parents=[json_flag],
+        help="N single tasks to N small models on hosted CI runners, one report "
+             "back in this queue")
+    swarm_sub = swarm.add_subparsers(dest="swarm_command")
+    sw_submit = swarm_sub.add_parser(
+        "submit", parents=[json_flag],
+        help="validate a task list and queue the swarm (a `ci` run that collects "
+             "its report)")
+    sw_submit.add_argument("tasks", help="task list (JSON): see awrun/swarm.py")
+    sw_submit.add_argument("--size", default="4B", choices=["2B", "4B", "9B"],
+                           help="model size every task runs on (default 4B)")
+    sw_submit.add_argument("--repo", default="Aitherium/awrun",
+                           help="OWNER/REPO that hosts the swarm workflow")
+    sw_submit.add_argument("--workflow", default="bonsai-swarm.yml")
+    sw_submit.add_argument("--ref", default="main")
+    sw_submit.add_argument("--priority", type=int, default=0)
+    sw_submit.add_argument("--name", default="")
+    sw_submit.add_argument("--timeout-s", dest="timeout_s", type=float, default=5400)
+    sw_submit.add_argument("--run", action="store_true",
+                           help="dispatch it now from this process and wait, instead "
+                                "of leaving it for a dispatcher")
+    sw_result = swarm_sub.add_parser(
+        "result", parents=[json_flag],
+        help="the collected report of a swarm run: verdicts, answers, tokens/s")
+    sw_result.add_argument("id")
 
     sub.add_parser("self-test", help="run the built-in self-test")
 
@@ -1820,6 +1860,112 @@ def cmd_surface(args: argparse.Namespace, store: "RunStore") -> int:
     return 0 if not (summary["no_ci"] or summary["red"]) else 1
 
 
+def swarm_report(item: RunItem) -> tuple[Optional[dict], str]:
+    """(report, why-not) for a finished swarm run. The report is the file the
+    dispatcher collected; the item's result only says where it is."""
+    if item.result is None:
+        return None, f"run {item.id} is {item.status}: nothing collected yet"
+    try:
+        info = json.loads(str(item.result.get("message") or ""))
+    except json.JSONDecodeError:
+        return None, f"run {item.id} {item.status}: {item.result.get('message')}"
+    path = Path(str(info.get("artifact_dir") or "")) / "swarm-report.json"
+    if not info.get("artifact_dir") or not path.is_file():
+        return None, (f"run {item.id} {item.status}: {info.get('error') or 'no report'} "
+                      f"({info.get('run_url') or 'no run'})")
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["run_url"] = info.get("run_url")
+    report["conclusion"] = info.get("conclusion")
+    report["report_path"] = str(path)
+    return report, ""
+
+
+#: Extra boundary patterns a host adds to the built-in classes (its own internal
+#: names and ticket ids). Named by AWRUN_SWARM_BOUNDARY, else found in a checkout.
+_SWARM_BOUNDARY_ENV = "AWRUN_SWARM_BOUNDARY"
+_SWARM_BOUNDARY_REL = ("AitherOS", "config", "fanout", "boundary_patterns.txt")
+
+
+def _swarm_boundary_patterns() -> list:
+    """The host's extra patterns. A file that is NAMED but unreadable is an error
+    (ValueError/OSError to the caller): the boundary must never quietly shrink."""
+    from awrun import swarm
+
+    named = os.environ.get(_SWARM_BOUNDARY_ENV, "").strip()
+    if named:
+        return swarm.load_patterns(named)
+    root = _monorepo_root()
+    if root is not None:
+        found = Path(root).joinpath(*_SWARM_BOUNDARY_REL)
+        if found.is_file():
+            return swarm.load_patterns(str(found))
+    return []
+
+
+def cmd_swarm(args: argparse.Namespace, store: "RunStore") -> int:
+    from awrun import swarm
+
+    if args.swarm_command == "result":
+        item = store.get(args.id)
+        if item is None:
+            print(f"ERROR: no such run: {args.id}", file=sys.stderr)
+            return 1
+        report, why = swarm_report(item)
+        if report is None:
+            print(why, file=sys.stderr)
+            return 1
+        if args.json:
+            _print_json(report)
+        else:
+            print(swarm.render_report(report))
+            print(f"run: {report.get('run_url')}")
+            print(f"report: {report['report_path']}")
+        return 0
+    if args.swarm_command != "submit":
+        print("usage: awrun swarm {submit,result} ...", file=sys.stderr)
+        return 2
+    try:
+        owner = args.repo.split("/", 1)[0]
+        tasks = swarm.load_tasks(args.tasks, allow_owner=owner)
+        body = swarm.inline(tasks)
+        hits = swarm.boundary_hits(tasks, _swarm_boundary_patterns())
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if hits:
+        # REFUSED, never redacted: a scrubbed task list would still have run.
+        print("ERROR: this task list may not be sent to a shared runner; nothing was "
+              "queued:", file=sys.stderr)
+        for h in hits:
+            print(f"  {h}", file=sys.stderr)
+        return 2
+    spec = {"workflow": args.workflow, "ref": args.ref, "repo": args.repo,
+            "inputs": {"tasks_json": body, "model_size": args.size},
+            "collect": {"artifact": "swarm-report", "timeout_s": float(args.timeout_s)}}
+    item = store.submit("ci", spec, priority=args.priority, name=args.name)
+    if not args.run:
+        _print_item(item, as_json=args.json)
+        return 0
+    from awrun.dispatcher import dispatch_once
+    print(f"{item.id}: {len(tasks)} task(s) on {args.size}, dispatching to "
+          f"{args.repo} and waiting", file=sys.stderr)
+    done = dispatch_once(store, worker_id="swarm-cli", run_ids=[item.id])
+    if done is None:
+        print(f"ERROR: {item.id} was not claimable (another worker has it?)", file=sys.stderr)
+        return 1
+    report, why = swarm_report(done)
+    if report is None:
+        print(why, file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json({"id": done.id, "status": done.status, **report})
+    else:
+        print(swarm.render_report(report))
+        print(f"awrun id: {done.id}")
+        print(f"run: {report.get('run_url')}")
+    return 0 if not report.get("missing") else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     # GENERATED doctor intercept (gen_aw_doctor.py) -- do not edit
     _dv = locals().get("argv")
@@ -1866,6 +2012,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "groups": cmd_groups,
         "capacity": cmd_capacity,
         "surface": cmd_surface,
+        "swarm": cmd_swarm,
         "deploy": cmd_deploy,
         "ps": cmd_ps,
         "rm": cmd_rm,

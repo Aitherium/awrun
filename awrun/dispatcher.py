@@ -257,20 +257,120 @@ def _build_ci_argv(item: RunItem) -> Optional[list[str]]:
     return argv
 
 
+def _gh(argv: list[str], timeout: float = 120) -> tuple[int, str]:
+    """Run one `gh` command. The single seam the collect path calls, so a test
+    can stand in for GitHub."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout, check=False,
+                               encoding="utf-8", errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, f"could not run gh: {exc}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+#: The workflow input that carries the run's id when `spec.collect` is set. The
+#: workflow must put it in its `run-name`, because `gh workflow run` returns no
+#: run id and "the newest run" is somebody else's the moment two are dispatched.
+COLLECT_ID_INPUT = "awrun_id"
+_COLLECT_DEFAULT_TIMEOUT_S = 5400.0
+
+
+def collect_dir(item_id: str) -> Path:
+    """Where a collected artifact of run `item_id` lands: beside the queue."""
+    from awrun.store import runs_dir
+    return runs_dir() / "artifacts" / item_id
+
+
+def _collect_ci(item: RunItem, *, gh: Callable[..., tuple[int, str]],
+                sleep_fn: Callable[[float], None] = time.sleep,
+                now_fn: Callable[[], float] = time.time) -> tuple[int, str]:
+    """Wait for the workflow run this item started, then bring its artifact home.
+
+    Without this a `ci` item is fire-and-forget: it is `done` the moment GitHub
+    accepts the dispatch, and whatever the workflow produced stays on GitHub
+    where no agent on this machine reads it. With `spec.collect` the item is
+    `done` when the run finished AND its artifact is on local disk; the message
+    is JSON naming the run and the directory.
+
+    The runner never calls back and holds no credential of ours: this side
+    PULLS, with the `gh` login it already dispatches with.
+    """
+    collect = item.spec.get("collect") or {}
+    artifact = str(collect.get("artifact") or "")
+    repo = str(item.spec.get("repo") or "")
+    workflow = str(item.spec.get("workflow") or "")
+    if not artifact or not repo:
+        return 1, "spec.collect needs an artifact name and spec.repo"
+    timeout_s = float(collect.get("timeout_s") or _COLLECT_DEFAULT_TIMEOUT_S)
+    poll_s = float(collect.get("poll_s") or 20.0)
+    deadline = now_fn() + timeout_s
+
+    # GitHub lists a dispatched run within seconds; minutes of nothing means the
+    # title does not carry the id, and waiting the whole run timeout would hide that.
+    appear_by = min(deadline, now_fn() + 180.0)
+    run: Optional[dict] = None
+    while run is None:
+        code, out = gh(["gh", "run", "list", "--repo", repo, "--workflow", workflow,
+                        "--limit", "30", "--json", "databaseId,displayTitle,url"])
+        if code == 0:
+            try:
+                rows = json.loads(out)
+            except json.JSONDecodeError:
+                rows = []
+            run = next((r for r in rows if item.id in str(r.get("displayTitle", ""))), None)
+        if run is None:
+            if now_fn() >= appear_by:
+                return 1, (f"dispatched, but no run of {workflow} in {repo} carries "
+                           f"{item.id} in its title. The workflow must declare the "
+                           f"`{COLLECT_ID_INPUT}` input and use it in `run-name`.")
+            sleep_fn(min(poll_s, 5.0))
+    run_id = str(run["databaseId"])
+
+    conclusion = ""
+    while True:
+        code, out = gh(["gh", "run", "view", run_id, "--repo", repo,
+                        "--json", "status,conclusion"])
+        if code == 0:
+            try:
+                state = json.loads(out)
+            except json.JSONDecodeError:
+                state = {}
+            if state.get("status") == "completed":
+                conclusion = str(state.get("conclusion") or "")
+                break
+        if now_fn() >= deadline:
+            return 1, json.dumps({"run_id": run_id, "run_url": run.get("url"),
+                                  "error": f"run did not finish within {int(timeout_s)} s"})
+        sleep_fn(poll_s)
+
+    dest = collect_dir(item.id)
+    dest.mkdir(parents=True, exist_ok=True)
+    code, out = gh(["gh", "run", "download", run_id, "--repo", repo, "-n", artifact,
+                    "-D", str(dest)], timeout=600)
+    files = sorted(f.name for f in dest.iterdir()) if dest.is_dir() else []
+    body = {"run_id": run_id, "run_url": run.get("url"), "conclusion": conclusion,
+            "artifact": artifact, "artifact_dir": str(dest), "files": files}
+    if code != 0 or not files:
+        body["error"] = f"artifact {artifact!r} could not be downloaded: {out.strip()[-300:]}"
+        return 1, json.dumps(body)
+    return (0 if conclusion == "success" else 1), json.dumps(body)
+
+
 def _real_run_ci(item: RunItem) -> tuple[int, str]:
     argv = _build_ci_argv(item)
     if argv is None:
         return 1, "spec.workflow is required"
-    try:
-        # gh workflow run only ENQUEUES the run and returns immediately — it
-        # does not wait for the job to finish, so a generous timeout here is
-        # about a hung `gh` CLI, not a slow workflow.
-        proc = subprocess.run(argv, capture_output=True, timeout=120, check=False,
-                               encoding="utf-8", errors="replace")
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 1, f"could not run gh: {exc}"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, out[-4000:]
+    collecting = bool(item.spec.get("collect"))
+    if collecting:
+        argv += ["-f", f"{COLLECT_ID_INPUT}={item.id}"]
+    # gh workflow run only ENQUEUES the run and returns immediately — it
+    # does not wait for the job to finish, so the timeout here is
+    # about a hung `gh` CLI, not a slow workflow.
+    code, out = _gh(argv)
+    if code != 0 or not collecting:
+        return code, out[-4000:]
+    return _collect_ci(item, gh=_gh)
 
 
 # ─────────────────────────────────────────────────────────────────────────
