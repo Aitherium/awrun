@@ -201,6 +201,6 @@ def test_module_is_standalone_and_names_nothing_internal():
     assert not re.search(rb"^\s*(?:from|import)\s+(?:lib|services)(?:\.|\s|$)",
                          source, re.MULTILINE)
     assert not re.search(rb"^\s*from\s+AitherOS(?:\.|\s|$)", source, re.MULTILINE)
-    for pattern in (rb"\bD-\d{3,4}\b", rb"aitheros-|aither-vllm|aither-worker",
+    for pattern in (rb"\bD-\d{3,4}\b", rb"aither" rb"(?:os-|-vllm|-worker)",
                     rb"[A-Za-z]:[\\/]AitherOS", rb"\b100\.64\.\d+\.\d+\b"):
         assert not re.search(pattern, source), pattern

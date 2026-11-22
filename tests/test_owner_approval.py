@@ -558,7 +558,7 @@ def test_a_registry_that_cannot_reach_genesis_is_refused(genesis, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "lib.core.AitherPorts", type(sys)("fake_ports"))
     sys.modules["lib.core.AitherPorts"].get_service_url = (
-        lambda name: Unreachable("https://aitheros-genesis:8001"))
+        lambda name: Unreachable("https://genesis.example:8001"))
     why = cli._authorize_gated("node-op", SPECS, aid)
     assert why and "not published to the host" in why
 

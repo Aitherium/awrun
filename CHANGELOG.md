@@ -16,6 +16,13 @@ All notable changes to `awrun` are recorded here.
 
 - **awrun**: several workers on one queue no longer crash, or run an item twice, when they race for it. The store wrote an item's new content at its old path before renaming it, which put the file back in the old directory for the loser of the race; on Windows the loser then died on `FileExistsError` (and the worker that picked up the copy died finishing it), on POSIX it took over the winner's claim. Nothing is written at the old path now, and each move takes a per-item lock (`locks/<id>.lock`, created with `O_EXCL`), because a Windows rename reports success to both racers. A rename refused on Windows while another process has the file open is retried for under a second instead of killing the worker.
 - **awrun**: a `comet-deploy` dispatch to an `https://` deployment service now verifies against the system store plus the CA bundle named by `AWRUN_CA_BUNDLE` (else `SSL_CERT_FILE`), the convention the relay lane already used. A fleet service signed by an internal CA was unreachable from a dispatcher whose environment did not happen to set `SSL_CERT_FILE`, and the failure read as "could not reach". A certificate the host does not trust is now reported as that, naming the variable to set. Verification is never turned off.
+- **awrun**: `python -m awrun.dispatcher --self-test` judges the code, not the machine. The self-test left host admission ON, so on a runner whose `MemAvailable` sits under the default 12 GB floor every heavy kind was deferred and eight assertions went red -- dispatch order across kinds and the whole lease/backoff block -- with nothing wrong in the code they name (measured 2026-11-22 on `ubuntu-latest`: `MemAvailable 6.9 GB < 12 GB`). Admission is now forced off for the duration, exactly as `tests/conftest.py` already does for pytest, and the deferral path is asserted explicitly with the verdict forced, so it is covered on Windows and macOS too, where `/proc/pressure` does not exist.
+
+## [0.2.9] - 2026-11-19
+
+### Added
+
+- **awrun**: kind `screen`, one awscreen crop-inspection batch. It is not a GPU kind (the vision model behind it is arbitrated by its scheduler, and the item caps its own concurrency at 4), so it submits without a `gpu` request. The spec carries file paths under the local queue root, never pixels. awrun has no built-in executor for it: a dispatcher started without the awscreen handler fails the item with the name of the worker to start (`python -m awscreen.awrun_kind`), and `awrun submit --kind screen` is refused because its owner submits it.
 
 ## [0.2.8] - 2026-11-08
 

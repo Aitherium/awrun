@@ -673,7 +673,7 @@ def _build_spec(args: argparse.Namespace) -> dict:
         spec = _submit_tunnel_spec(args)
     elif kind == "node-op":
         spec = _submit_node_op_spec(args)
-    elif kind in ("render", "artpack", "solve", "blender-frame"):
+    elif kind in ("render", "artpack", "solve", "blender-frame", "screen"):
         raise RunError(f"--kind {kind} is host-registered: its owner submits it with "
                        f"the spec that worker understands (RunStore.submit), not this CLI")
     elif kind == "lab-run":

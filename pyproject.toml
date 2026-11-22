@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awrun"
-version = "0.2.8"
+version = "0.2.9"
 description = "A priority-aware queue and dispatcher for agentic runs and ad-hoc CI builds — real dynamic priority for the class of work we control, instead of GitHub Actions' opaque FIFO."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,7 @@ governed = ["awiam", "awbac", "awdit", "awseal", "awshare"]
 # gated submit by approval is refused, never allowed.
 approval = ["awstorage", "cryptography"]
 
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "awstorage", "cryptography"]  # the approval tests verify a real receipt
 
 [project.scripts]
 awrun = "awrun.cli:main"

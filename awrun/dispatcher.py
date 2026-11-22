@@ -33,7 +33,7 @@ Ten kinds, ten handlers, one dispatch loop:
   `services.mesh.awrun_node_op` (ssh + memory admission), never awrun.
   Fleet membership (2026-11-12): `"action": "fleet-join"|"fleet-leave"|"fleet-status"`
   with `{"node", "controller"?, "pin_sha256"?, "force"?, "dry_run"?}` joins, revokes or
-  reads a node on the placement controller (aither-registry :8149) through
+  reads a node on the placement controller through
   `lib.mesh.fleet_membership`; drain with `dev/tools/awrun_node_op_worker.py --once`.
 * `flow`          -- a journaled workflow in a child process. The run id is the
   journal id, so a flow that was suspended (or killed) continues from its journal:
@@ -718,6 +718,8 @@ _real_run_node_op = _host_registered_gap(
     "node-op", "provisioning, recovering or joining/leaving a mesh node; worker: "
     "AitherOS/dev/tools/awrun_node_op_worker.py")
 _real_run_blender_frame = _host_registered_gap("blender-frame", "a Blender frame range")
+_real_run_screen = _host_registered_gap(
+    "screen", "an awscreen crop-inspection batch; worker: python -m awscreen.awrun_kind")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -839,6 +841,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "lab-run": _real_run_lab_run,
     "node-op": _real_run_node_op,
     "blender-frame": _real_run_blender_frame,
+    "screen": _real_run_screen,
 }
 
 
@@ -880,6 +883,14 @@ def dispatch_once(store: RunStore, *, worker_id: str,
     if claimed is None:
         return None
     _broadcast(claimed, "claimed", client=relay_client)
+    # The claim is a lifecycle transition too: the sinks name the workspace the
+    # run's lineage carries, so a queued job is followable from the moment a
+    # worker picks it up (P2).
+    try:
+        from awrun.store import _emit_transition
+        _emit_transition(claimed, "claimed", worker=worker_id)
+    except Exception as exc:  # noqa: BLE001 - visibility never blocks dispatch
+        logger.debug("awrun: lifecycle claim emit skipped: %s", exc)
 
     if claimed.kind == "agent":
         lease_error = _acquire_paths(claimed, actor=actor)
@@ -1087,6 +1098,24 @@ def _self_test() -> int:
         if not cond:
             ok = False
 
+    # Host admission judges the LIVE host -- /proc pressure, MemAvailable, and a
+    # fleet placement node's floor -- so a self-test that leaves it on judges the
+    # machine, not the code. Measured 2026-11-22 on a GitHub-hosted runner
+    # (`MemAvailable 6.9 GB < 12 GB`, the default floor): every HEAVY kind was
+    # "not now"-ed and EIGHT assertions below went red -- dispatch order across
+    # kinds and the whole lease/backoff block -- with nothing wrong in the code
+    # they name. tests/conftest.py already forces this off for pytest; the shipped
+    # self-test must say the same thing, and the refusal path is asserted on its
+    # own, below, with the verdict FORCED rather than read from the host.
+    _saved_admission = os.environ.get("AWRUN_HOST_ADMISSION")
+    os.environ["AWRUN_HOST_ADMISSION"] = "off"
+
+    def _restore_admission() -> None:
+        if _saved_admission is None:
+            os.environ.pop("AWRUN_HOST_ADMISSION", None)
+        else:
+            os.environ["AWRUN_HOST_ADMISSION"] = _saved_admission
+
     # ── argv builders (pure, no process spawned) ────────────────────────
     real_item = RunItem(id="r-test0000", kind="agent",
                          spec={"agent": "local-5090", "task": "verify the deploy"})
@@ -1190,6 +1219,37 @@ def _self_test() -> int:
         result4 = dispatch_once(store, worker_id="w1", run_fns={"agent": fake_agent, "ci": fake_ci})
         check("a kind with no registered run_fn fails loudly rather than vanishing",
               result4 is not None and result4.id == orphan.id and result4.status == "failed")
+
+    # ── Host admission: "not now" is a requeue with a backoff, never failed ─
+    # The verdict is FORCED here, so this covers the refusal path on every host
+    # (Windows and macOS have no /proc/pressure at all) instead of depending on
+    # the machine being busy at the moment the self-test happens to run.
+    with tempfile.TemporaryDirectory() as td:
+        store = RunStore(td)
+        heavy = store.submit("ci", {"workflow": "x.yml"}, priority=5)
+        asked: list[str] = []
+
+        def _refusing_admit(kind, *a, **kw):
+            asked.append(kind)
+            return False, "MemAvailable 6.9 GB < 12 GB", None
+
+        _real_admit = host_admission.admit
+        host_admission.admit = _refusing_admit
+        try:
+            back = dispatch_once(store, worker_id="w1",
+                                 run_fns={"ci": lambda i: (0, "ran anyway")},
+                                 now_fn=lambda: 1000.0)
+        finally:
+            host_admission.admit = _real_admit
+        check("a heavy item the host refuses is REQUEUED with a backoff, never failed",
+              back is not None and back.id == heavy.id and back.status == "queued"
+              and back.requeues == 1 and back.not_before == 1015.0
+              and asked == ["ci"])
+        check("...and the refusal it waits on rides along on the item",
+              "host over budget" in ((back.wait or {}).get("reason") or "")
+              if back is not None else False)
+        check("...and it is not runnable before its backoff expires",
+              store.claim_next(worker_id="w1", now=1014.0) is None)
 
     # ── Phase 4: lease-blocked items are SKIPPED, not claimed, not failed ─
     with tempfile.TemporaryDirectory() as td:
@@ -1350,6 +1410,7 @@ def _self_test() -> int:
     except Exception:
         check("a broken relay client during broadcast never raises out of dispatch", False)
 
+    _restore_admission()
     print("SELF-TEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

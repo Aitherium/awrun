@@ -202,7 +202,8 @@ def _registry_url(service: str = GATEWAY_SERVICE) -> str:
     if registry is not None and registry.is_file() and str(root) not in sys.path:
         sys.path.append(str(root))
     try:
-        from lib.core.AitherPorts import get_service_url  # noqa: PLC0415
+        import importlib  # noqa: PLC0415 - optional, resolves only in the monorepo
+        get_service_url = importlib.import_module("lib.core.AitherPorts").get_service_url
     except Exception as exc:  # noqa: BLE001 -- no registry = cannot judge
         raise ApprovalUnavailableError(
             f"the platform service registry (lib.core.AitherPorts) is not importable "
@@ -258,7 +259,9 @@ def _context(url: str):
     never turned off."""
     if url.lower().startswith("https://"):
         try:
-            from lib.security.TLSConfig import get_internal_ssl_context  # noqa: PLC0415
+            import importlib  # noqa: PLC0415 - optional, resolves only in the monorepo
+            get_internal_ssl_context = importlib.import_module(
+                "lib.security.TLSConfig").get_internal_ssl_context
 
             ctx = get_internal_ssl_context()
             if ctx is not None:

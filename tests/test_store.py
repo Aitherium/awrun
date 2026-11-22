@@ -168,6 +168,13 @@ def test_gpu_kinds_are_exactly_render_artpack_solve():
     assert GPU_KINDS == frozenset({"render", "artpack", "solve", "blender-frame"})
 
 
+def test_screen_kind_submits_without_a_gpu_request(store):
+    # awscreen crop inspection: a scheduler arbitrates the model, so no lease door.
+    assert "screen" not in GPU_KINDS
+    item = store.submit("screen", {"manifest": "m.json", "max_concurrency": 4})
+    assert item.kind == "screen" and item.gpu is None
+
+
 def test_gpu_request_is_normalised_with_defaults(store):
     item = store.submit("render", {"job": "x"}, gpu={"class": "arc", "vram_mb": 8000})
     assert item.gpu == {"class": "arc", "vram_mb": 8000, "ttl_s": 600,

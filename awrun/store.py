@@ -35,6 +35,7 @@ over a network mount, which a Python-level lock is not.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -97,8 +98,11 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 #: separate kind on purpose: the Remotion `render` worker claims every `render` item, so
 #: a Blender range filed under `render` would be claimed by a worker that cannot run it.
 #: The owner is `AitherOS/dev/tools/awrun_blender_worker.py` (claims kinds=[blender-frame] only).
+#: `screen` (2026-11-19): one awscreen crop-inspection batch (a manifest of crop files
+#: under the LOCAL awrun root). NOT a GPU kind: the vision model behind it is arbitrated
+#: by its scheduler, and the item caps its own concurrency. Owner: `awscreen.awrun_kind`.
 KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow",
-         "lab-run", "node-op", "blender-frame")
+         "lab-run", "node-op", "blender-frame", "screen")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease
@@ -159,7 +163,12 @@ def validate_gpu(kind: str, gpu: Optional[dict[str, Any]]) -> Optional[dict[str,
 
 #: Why this run exists. Free-form ids owned by whoever plans the work; the queue
 #: only carries them so every run can be traced to what asked for it.
-LINEAGE_KEYS = ("intent", "goal", "expedition", "flow", "plan", "notebook", "parent_run")
+#: ``tenant_id``/``workspace_id`` joined this list with P2: queued work must be
+#: sortable by workspace and answerable to the same scope model as the rest of
+#: the platform (platform>tenant>workspace>project>group>user/agent). Both are
+#: ordinary short-id values, so the existing validator already covers them.
+LINEAGE_KEYS = ("intent", "goal", "expedition", "flow", "plan", "notebook",
+                "parent_run", "tenant_id", "workspace_id")
 _LINEAGE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@#-]{0,199}$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 _LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
@@ -437,6 +446,7 @@ class RunStore:
                         status=STATUS_QUEUED, paths=list(paths or []), gpu=gpu,
                         name=name, lineage=lineage, limits=limits, egress=egress)
         self._write(STATUS_QUEUED, item)
+        _emit_transition(item, "submit")
         return item
 
     def bump(self, item_id: str, priority: int) -> RunItem:
@@ -583,7 +593,10 @@ class RunStore:
         return None
 
     def start(self, item_id: str) -> Optional[RunItem]:
-        return self._move(item_id, STATUS_CLAIMED, STATUS_RUNNING)
+        item = self._move(item_id, STATUS_CLAIMED, STATUS_RUNNING)
+        if item is not None:
+            _emit_transition(item, "running")
+        return item
 
     def finish(self, item_id: str, *, status: str, result: Optional[dict[str, Any]] = None
                ) -> Optional[RunItem]:
@@ -595,6 +608,9 @@ class RunStore:
 
         done = self._move(item_id, STATUS_RUNNING, status, mutate=_set_result)
         self._suspend_marker(item_id).unlink(missing_ok=True)
+        if done is not None:
+            _emit_transition(done, status,
+                             error=str((result or {}).get("message") or "")[:300])
         return done
 
     def requeue(self, item_id: str, not_before: float, *,
@@ -627,7 +643,11 @@ class RunStore:
             item.requeues = int(item.requeues or 0) + 1
             item.wait = wait
 
-        return self._move(item_id, status, STATUS_QUEUED, mutate=_back)
+        back = self._move(item_id, status, STATUS_QUEUED, mutate=_back)
+        if back is not None:
+            _emit_transition(back, "requeued",
+                             reason=str((wait or {}).get("reason") or "")[:300])
+        return back
 
     # -- suspend / resume -------------------------------------------------
 
@@ -682,6 +702,8 @@ class RunStore:
 
         parked = self._move(item_id, STATUS_RUNNING, STATUS_SUSPENDED, mutate=_checkpoint)
         self._suspend_marker(item_id).unlink(missing_ok=True)
+        if parked is not None:
+            _emit_transition(parked, "suspended")
         return parked
 
     def resume(self, item_id: str) -> RunItem:
@@ -733,7 +755,10 @@ class RunStore:
         status, _ = located
         if status not in OPEN_STATUSES:
             return self._read(status, item_id)
-        return self._move(item_id, status, STATUS_CANCELLED)
+        cancelled = self._move(item_id, status, STATUS_CANCELLED)
+        if cancelled is not None:
+            _emit_transition(cancelled, "cancelled")
+        return cancelled
 
     # ── reads ────────────────────────────────────────────────────────────
 
@@ -786,3 +811,22 @@ class RunStore:
 
 def get_store() -> RunStore:
     return RunStore()
+
+
+def _emit_transition(item: RunItem, event: str, **extra: Any) -> None:
+    """Record an awrun transition on the lifecycle sinks. Best-effort.
+
+    awrun is import-safe on hosts without AitherOS (its own self-tests run
+    standalone), so the sink is an optional import: a host without ``lib``
+    simply has no lifecycle sink and the queue is unaffected.
+    """
+    try:
+        import importlib  # noqa: PLC0415 - optional, resolves only in the monorepo
+        emit_awrun_transition = importlib.import_module(
+            "lib.collective.lifecycle").emit_awrun_transition
+    except Exception:  # noqa: BLE001 - standalone awrun host
+        return
+    try:
+        emit_awrun_transition(item, event, **extra)
+    except Exception as exc:  # noqa: BLE001 - telemetry never fails a queue move
+        logging.getLogger("awrun.store").debug("transition emit skipped: %s", exc)
