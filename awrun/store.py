@@ -101,8 +101,13 @@ OPEN_STATUSES = frozenset({STATUS_QUEUED, STATUS_CLAIMED, STATUS_RUNNING,
 #: `screen` (2026-11-19): one awscreen crop-inspection batch (a manifest of crop files
 #: under the LOCAL awrun root). NOT a GPU kind: the vision model behind it is arbitrated
 #: by its scheduler, and the item caps its own concurrency. Owner: `awscreen.awrun_kind`.
+#: `eval` (2026-11-23): one agent-eval sweep -- `agent_ruler.py --arm A --suites S` for ONE
+#: arm and ONE suite. Host-registered like `node-op`: the ruler and its harnesses live in
+#: the monorepo, never in awrun. NOT in GPU_KINDS: a frontier/harness arm needs no card,
+#: so the submit attaches a `gpu` request ONLY for an arm of kind "local", and the
+#: dispatcher's lease door serializes those. Owner: `AitherOS/dev/tools/awrun_eval_worker.py`.
 KINDS = ("agent", "ci", "comet-deploy", "render", "artpack", "solve", "tunnel", "flow",
-         "lab-run", "node-op", "blender-frame", "screen")
+         "lab-run", "node-op", "blender-frame", "screen", "eval")
 
 #: Kinds that touch a GPU. For these a `gpu` request is REQUIRED at submit --
 #: an item that does not say what it needs cannot be admitted by a GPU lease
@@ -490,10 +495,10 @@ class RunStore:
                     if time.time() - lock.stat().st_mtime > _LOCK_STALE_S:
                         lock.unlink(missing_ok=True)
                         continue
-                except OSError:
-                    pass  # released while we looked: try again
-            except PermissionError:
-                pass  # Windows: the name is still being deleted
+                except OSError as exc:  # released while we looked: try again
+                    logging.getLogger("awrun.store").debug("lock vanished: %s", exc)
+            except PermissionError as exc:  # Windows: the name is still being deleted
+                logging.getLogger("awrun.store").debug("lock busy: %s", exc)
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.005)
@@ -503,8 +508,8 @@ class RunStore:
             if held:
                 try:
                     lock.unlink()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logging.getLogger("awrun.store").debug("lock unlink: %s", exc)
 
     def _move(self, item_id: str, from_status: str, to_status: str, *,
                mutate=None) -> Optional[RunItem]:

@@ -35,7 +35,12 @@ Ten kinds, ten handlers, one dispatch loop:
   with `{"node", "controller"?, "pin_sha256"?, "force"?, "dry_run"?}` joins, revokes or
   reads a node on the placement controller through
   `lib.mesh.fleet_membership`; drain with `dev/tools/awrun_node_op_worker.py --once`.
-* `flow`          -- a journaled workflow in a child process. The run id is the
+* `eval`          -- host-registered (2026-11-23). Spec: `{"arm": <agent_ruler.ARMS key>,
+  "suite": "s1"|"s2"|"s3"|"s4", "ids"?: [str], "work_root"?: str, "arm_kind",
+  "arm_transport"}`; an arm of kind "local" also carries a `gpu` request, so the lease
+  door serializes local sweeps on the card. Drain with
+  `dev/tools/awrun_eval_worker.py --once` (runs `agent_ruler.py` as a child).
+* `flow`         -- a journaled workflow in a child process. The run id is the
   journal id, so a flow that was suspended (or killed) continues from its journal:
   the calls it already made are replayed, not made again.
 
@@ -666,7 +671,7 @@ def _broadcast(item: RunItem, event: str, *, client=None) -> None:
     try:
         from awrelay.envelope import Kind
         label = item.spec.get("workflow") or item.spec.get("task") \
-            or item.spec.get("service_name") or item.kind
+            or item.spec.get("service_name") or item.spec.get("arm") or item.kind
         client.send_text(
             channel=os.getenv(_RELAY_CHANNEL_ENV, _DEFAULT_RELAY_CHANNEL),
             text=f"{item.id} [{item.kind}] {label}: {event}",
@@ -718,6 +723,9 @@ _real_run_node_op = _host_registered_gap(
     "node-op", "provisioning, recovering or joining/leaving a mesh node; worker: "
     "AitherOS/dev/tools/awrun_node_op_worker.py")
 _real_run_blender_frame = _host_registered_gap("blender-frame", "a Blender frame range")
+_real_run_eval = _host_registered_gap(
+    "eval", "an agent-eval sweep (agent_ruler.py); worker: "
+    "AitherOS/dev/tools/awrun_eval_worker.py")
 _real_run_screen = _host_registered_gap(
     "screen", "an awscreen crop-inspection batch; worker: python -m awscreen.awrun_kind")
 
@@ -842,6 +850,7 @@ _RUN_FNS: dict[str, RunFn] = {
     "node-op": _real_run_node_op,
     "blender-frame": _real_run_blender_frame,
     "screen": _real_run_screen,
+    "eval": _real_run_eval,
 }
 
 

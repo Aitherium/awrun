@@ -638,6 +638,120 @@ def _submit_node_op_spec(args: argparse.Namespace) -> dict:
     return spec
 
 
+#: kind=eval (2026-11-23): the suites agent_ruler.py drives, and the default GPU request
+#: an arm of kind "local" carries so the lease door serializes local sweeps on the card.
+#: The lease is the serialization token for a sweep against an ALREADY-RESIDENT model,
+#: not a model load -- so it asks for a small slice, not the card.
+_EVAL_SUITES = ("s1", "s2", "s3", "s4")
+_EVAL_SPEC_KEYS = frozenset({"arm", "suite", "ids", "work_root", "timeout_s", "gpu"})
+_EVAL_LOCAL_GPU = {"class": "training", "vram_mb": 2048, "ttl_s": 900}
+_RULER_ENV = "AWRUN_EVAL_RULER"
+_RULER_CACHE: dict = {}
+
+
+def _find_ruler() -> Optional[Path]:
+    """agent_ruler.py: $AWRUN_EVAL_RULER, else the monorepo this awrun sits in
+    (AitherOS/packages/awrun -> AitherOS/dev/tools), else the cwd's repo."""
+    explicit = os.environ.get(_RULER_ENV, "").strip()
+    if explicit:
+        return Path(explicit) if Path(explicit).is_file() else None
+    roots = list(Path(__file__).resolve().parents) + [Path.cwd(), *Path.cwd().parents]
+    for root in roots:
+        for rel in ("dev/tools/agent_ruler.py", "AitherOS/dev/tools/agent_ruler.py"):
+            cand = root / rel
+            if cand.is_file():
+                return cand
+    return None
+
+
+def eval_arms() -> dict:
+    """{arm id: {"kind", "transport"}} read from agent_ruler.ARMS, imported by path.
+    Raises RunError when the ruler cannot be found or imported: an arm that cannot be
+    validated is refused, never queued on trust."""
+    path = _find_ruler()
+    if path is None:
+        raise RunError(f"--kind eval cannot validate --arm: agent_ruler.py not found "
+                       f"(set ${_RULER_ENV} to its path)")
+    key = str(path)
+    if key not in _RULER_CACHE:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(f"_awrun_agent_ruler_{len(_RULER_CACHE)}",
+                                                      path)
+        if spec is None or spec.loader is None:
+            raise RunError(f"--kind eval: {path} is not importable")
+        mod = importlib.util.module_from_spec(spec)
+        # Registered BEFORE exec: the ruler's @dataclass Arm looks its module up in
+        # sys.modules, and an unregistered module raises AttributeError on import.
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+            arms = {k: {"kind": str(getattr(a, "kind", "")),
+                        "transport": str(getattr(a, "transport", ""))}
+                    for k, a in dict(mod.ARMS).items()}
+        except Exception as exc:  # noqa: BLE001 - any import failure = cannot validate
+            raise RunError(f"--kind eval: importing {path} failed: "
+                           f"{type(exc).__name__}: {exc}") from exc
+        _RULER_CACHE[key] = arms
+    return _RULER_CACHE[key]
+
+
+def _submit_eval_spec(args: argparse.Namespace) -> dict:
+    """The `eval` RunItem spec, validated at submit. --spec-json is the base and
+    --arm/--suite override it. A local arm gets a `gpu` request (lease-serialized); a
+    frontier/harness arm gets none, and a `gpu` asked for one is refused."""
+    spec: dict = {}
+    raw = getattr(args, "spec_json", None)
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RunError(f"--spec-json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise RunError("--kind eval takes ONE --spec-json object (one arm, one suite)")
+        spec.update(parsed)
+    if getattr(args, "arm", None):
+        spec["arm"] = args.arm
+    if getattr(args, "suite", None):
+        spec["suite"] = args.suite
+    extra = sorted(set(spec) - _EVAL_SPEC_KEYS)
+    if extra:
+        raise RunError(f"--kind eval takes no {', '.join(extra)} "
+                       f"(allowed: {', '.join(sorted(_EVAL_SPEC_KEYS))})")
+    arm = str(spec.get("arm") or "").strip()
+    suite = str(spec.get("suite") or "").strip()
+    if suite not in _EVAL_SUITES:
+        raise RunError(f"--suite must be one of {_EVAL_SUITES}, got {spec.get('suite')!r}")
+    arms = eval_arms()
+    if arm not in arms:
+        raise RunError(f"--arm {arm!r} is not an agent_ruler arm; known: "
+                       f"{', '.join(sorted(arms))}")
+    out: dict = {"arm": arm, "suite": suite, "arm_kind": arms[arm]["kind"],
+                 "arm_transport": arms[arm]["transport"]}
+    if "ids" in spec:
+        ids = spec["ids"]
+        if not isinstance(ids, list) or not all(isinstance(i, str) and i.strip()
+                                                and " " not in i for i in ids):
+            raise RunError(f"ids must be a list of non-empty strings, got {ids!r}")
+        if ids:
+            out["ids"] = list(ids)
+    if spec.get("work_root") is not None:
+        wr = spec["work_root"]
+        if not isinstance(wr, str) or not wr.strip():
+            raise RunError(f"work_root must be a non-empty path string, got {wr!r}")
+        out["work_root"] = wr.strip()
+    if "timeout_s" in spec:
+        t = spec["timeout_s"]
+        if isinstance(t, bool) or not isinstance(t, int) or t <= 0:
+            raise RunError(f"timeout_s must be a positive integer, got {t!r}")
+        out["timeout_s"] = t
+    if out["arm_kind"] == "local":
+        out["gpu"] = dict(spec.get("gpu") or _EVAL_LOCAL_GPU)
+    elif spec.get("gpu"):
+        raise RunError(f"arm {arm} is {out['arm_kind'] or 'not local'} "
+                       f"(transport {out['arm_transport']}): it needs no GPU lease")
+    return out
+
+
 def _build_spec(args: argparse.Namespace) -> dict:
     """The run's spec from parsed arguments. PURE -- it authorizes nothing and
     writes nothing, so `apply` can compare a manifest to the queue before it
@@ -673,6 +787,8 @@ def _build_spec(args: argparse.Namespace) -> dict:
         spec = _submit_tunnel_spec(args)
     elif kind == "node-op":
         spec = _submit_node_op_spec(args)
+    elif kind == "eval":
+        spec = _submit_eval_spec(args)
     elif kind in ("render", "artpack", "solve", "blender-frame", "screen"):
         raise RunError(f"--kind {kind} is host-registered: its owner submits it with "
                        f"the spec that worker understands (RunStore.submit), not this CLI")
@@ -1196,6 +1312,50 @@ def _self_test() -> int:
         check("a second claim on an already-claimed item returns None, not an error",
               again is None)
 
+    # ── kind=eval: arm validated against the ruler; only a local arm leases ──
+    with tempfile.TemporaryDirectory() as td:
+        store = RunStore(Path(td) / "runs")
+        ruler = Path(td) / "agent_ruler.py"
+        ruler.write_text(
+            "from types import SimpleNamespace as A\n"
+            "ARMS = {'L-x': A(kind='local', transport='openai'),\n"
+            "        'H-x': A(kind='frontier', transport='harness')}\n", encoding="utf-8")
+        old_ruler = os.environ.get(_RULER_ENV)
+        os.environ[_RULER_ENV] = str(ruler)
+        try:
+            def ev(**kw) -> argparse.Namespace:
+                base = dict(kind="eval", priority=0, paths=[], json=False, spec_json=None,
+                            arm=None, suite=None)
+                base.update(kw)
+                return argparse.Namespace(**base)
+            rc_l = cmd_submit(ev(spec_json=json.dumps(
+                {"arm": "L-x", "suite": "s2", "ids": ["a"]})), store)
+            rc_h = cmd_submit(ev(arm="H-x", suite="s2"), store)
+            got = {i.spec["arm"]: i for i in store.list(statuses=["queued"], kind="eval")}
+            check("eval: a local arm queues WITH a gpu request, a harness arm without",
+                  rc_l == 0 and rc_h == 0 and got["L-x"].gpu is not None
+                  and got["L-x"].spec["ids"] == ["a"] and got["H-x"].gpu is None
+                  and got["H-x"].spec["arm_transport"] == "harness")
+            for bad_spec in ({"arm": "nope", "suite": "s2"}, {"arm": "L-x", "suite": "s9"},
+                             {"arm": "L-x", "suite": "s2", "ids": "a"},
+                             {"arm": "H-x", "suite": "s2",
+                              "gpu": {"class": "training", "vram_mb": 1}},
+                             {"arm": "L-x", "suite": "s2", "bogus": 1}):
+                check(f"eval: {bad_spec} is refused at submit (exit 2)",
+                      cmd_submit(ev(spec_json=json.dumps(bad_spec)), store) == 2)
+            check("eval: nothing refused reached the queue",
+                  len(store.list(statuses=["queued"], kind="eval")) == 2)
+            os.environ[_RULER_ENV] = str(Path(td) / "missing.py")
+            _RULER_CACHE.clear()
+            check("eval: no findable ruler = the arm cannot be validated = refused (exit 2)",
+                  cmd_submit(ev(arm="L-x", suite="s2"), store) == 2)
+        finally:
+            _RULER_CACHE.clear()
+            if old_ruler is None:
+                os.environ.pop(_RULER_ENV, None)
+            else:
+                os.environ[_RULER_ENV] = old_ruler
+
     # ── Phase 8: comet-deploy submit is trust-plane gated end to end ─────
     with tempfile.TemporaryDirectory() as td:
         store = RunStore(td)
@@ -1422,7 +1582,8 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--spec-json", dest="spec_json",
                          help="[kind=comet-deploy] full AitherComet DeployRequest body as "
                               "a JSON object; --service-name/--target override matching keys. "
-                              "[kind=node-op] the spec, or a JSON LIST of specs = one batch")
+                              "[kind=node-op] the spec, or a JSON LIST of specs = one batch. "
+                              "[kind=eval] {arm, suite, ids?, work_root?, timeout_s?}")
     submit.add_argument("--action", choices=list(_TUNNEL_ACTIONS + _NODE_OP_ACTIONS),
                          help="[kind=tunnel] expose|retire; [kind=node-op] "
                               "provision|recover|check|fleet-join|fleet-leave|"
@@ -1449,6 +1610,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--force", action="store_true",
                          help="[kind=node-op] fleet-join: re-join an approved node; "
                               "fleet-leave: revoke although units are still placed")
+    submit.add_argument("--arm", help="[kind=eval] an agent_ruler.py arm id "
+                                      "(agent_ruler.py --list)")
+    submit.add_argument("--suite", choices=list(_EVAL_SUITES),
+                         help="[kind=eval] the ruler suite; ids/work_root/timeout_s "
+                              "go in --spec-json")
 
     submit.add_argument("--approval", dest="approval_id",
                          help="[gated kinds] spend this owner approval (apr-...) decided on "
