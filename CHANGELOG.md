@@ -18,6 +18,12 @@ All notable changes to `awrun` are recorded here.
 - **awrun**: a `comet-deploy` dispatch to an `https://` deployment service now verifies against the system store plus the CA bundle named by `AWRUN_CA_BUNDLE` (else `SSL_CERT_FILE`), the convention the relay lane already used. A fleet service signed by an internal CA was unreachable from a dispatcher whose environment did not happen to set `SSL_CERT_FILE`, and the failure read as "could not reach". A certificate the host does not trust is now reported as that, naming the variable to set. Verification is never turned off.
 - **awrun**: `python -m awrun.dispatcher --self-test` judges the code, not the machine. The self-test left host admission ON, so on a runner whose `MemAvailable` sits under the default 12 GB floor every heavy kind was deferred and eight assertions went red -- dispatch order across kinds and the whole lease/backoff block -- with nothing wrong in the code they name (measured 2026-11-22 on `ubuntu-latest`: `MemAvailable 6.9 GB < 12 GB`). Admission is now forced off for the duration, exactly as `tests/conftest.py` already does for pytest, and the deferral path is asserted explicitly with the verdict forced, so it is covered on Windows and macOS too, where `/proc/pressure` does not exist.
 
+## [0.2.10] - 2026-11-24
+
+### Fixed
+
+- **awrun**: a `--kind flow --script` module is registered in `sys.modules` before it is executed. A flow script that defines a `@dataclass` under `from __future__ import annotations` looks itself up there while it loads, so every such script died with `'NoneType' object has no attribute '__dict__'` and the run reported a failure that named neither the script nor the line.
+
 ## [0.2.9] - 2026-11-19
 
 ### Added

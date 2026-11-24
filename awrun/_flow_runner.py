@@ -33,6 +33,10 @@ def _load(entry: str, script: str, function: str):
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE exec: a script that defines a @dataclass looks itself up in
+    # sys.modules while it loads, and an unregistered one dies with
+    # "'NoneType' object has no attribute '__dict__'" (2026-11-24, the s2 task miner).
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return getattr(module, function)
 
