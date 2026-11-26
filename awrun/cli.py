@@ -1535,8 +1535,15 @@ def _self_test() -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from . import __version__
+
     parser = argparse.ArgumentParser(
         prog="awrun", description="A priority-aware queue for agentic runs and ad-hoc CI builds.")
+    parser.add_argument("--version", action="version", version=f"awrun {__version__}")
+    parser.add_argument(
+        "--self-test", "--selftest", dest="self_test", action="store_true",
+        help="run offline awrun self-test",
+    )
     sub = parser.add_subparsers(dest="command")
 
     # --json is defined on a shared PARENT rather than the top-level parser:
@@ -2154,7 +2161,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "self-test":
+    if getattr(args, "self_test", False) or args.command == "self-test":
         from awrun import trail
         with trail.scratch_log():
             return _self_test()
